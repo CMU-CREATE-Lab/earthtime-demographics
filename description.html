@@ -1,0 +1,178 @@
+<!DOCTYPE HTML>
+<html>
+<head>
+<style>
+body {
+  font-size:12pt;
+}
+#controls {
+  background-color:#ccf;
+  padding:7px;
+}
+#tables {
+  background-color:#fff;
+}
+em {
+  color:#000;
+  font-style:normal;
+}
+p {
+  margin: 0px;
+}
+.column:hover {
+  background-color: yellow;
+  color:#000;
+}
+.table {
+  margin-top:0.7em;
+  text-indent: -8em;
+  margin-left: 8em;
+  color:#888;
+}
+.column {
+  margin-left:3em;
+  color:#888;
+}
+.column p {
+  margin-left:0em;
+  text-indent:-11em;
+  font-size:10pt;
+  margin-left:11em;
+}
+.hideColumns .column {
+  display:none;
+}
+</style>
+<link rel="stylesheet" href="//code.jquery.com/ui/1.12.1/themes/base/jquery-ui.css">
+<script src="https://code.jquery.com/jquery-3.3.1.min.js"></script>
+<script src="https://code.jquery.com/ui/1.12.1/jquery-ui.js"></script>
+<script>
+var table_search_records;
+
+function load(x) {
+  console.log('Received json');
+  table_search_records = [];
+  resize();
+
+  for (var i = 0; i < x.tables.length; i++) {
+    var table = x.tables[i];
+    var search = [x.name + '.' + table.name, table.description];
+
+    var html = ['<div class="table">Table ' + table.name + ' &nbsp;&nbsp; <em>' + table.description + '</em></div>'];
+
+    for (var j = 0; j < table.columns.length; j++) {
+      html.push('<div class="column">');
+      var column = table.columns[j];
+      var columnName = x.name + '.' + table.name + column[0];
+      html.push('<p><button data-colname="' + columnName + '">copy</button> ');
+      html.push('Column ' + column[0] + ' &nbsp;&nbsp; <em>' + column[1] + '</em></p>')
+      search.push(columnName);
+      search.push(column[1]);
+      html.push('</div>');
+    }
+    var div = $('<div/>').html(html.join(''));
+    $('#tables').append(div);
+    table_search_records.push({$element:div, search:search.join(' ').toLowerCase()});
+  }
+  console.log('Created HTML');
+  $('button').click(copy);
+  $('#loading').hide();
+  changeFilter();
+}
+
+function changeColumnVisibility(e) {
+  if (this.value == 'show') {
+    $('body').removeAttr('class');
+  } else {
+    $('body').attr('class', 'hideColumns');
+  }
+}
+
+var debugRecord;
+
+function changeFilter(e) {
+  var nShown = 0;
+  var searchTokens = $('#filter').val().toLowerCase().trim().split(/\s+/);
+  for (var i = 0; i < table_search_records.length; i++) {
+    var record = table_search_records[i];
+    var show = true;
+    for (var j = 0; j < searchTokens.length; j++) {
+      if (!record.search.includes(searchTokens[j])) {
+        show = false;
+        break;
+      }
+    }
+    if (show) {
+      record.$element.show();
+      nShown++;
+    } else {
+      record.$element.hide();
+    }
+  }
+  $('#filterStats').text('Showing ' + nShown + ' tables of ' + table_search_records.length);
+}
+
+function resize() {
+  $('#tables').height($(window).height() - $('#controls').height() - 20);
+  $('#tables').css('position', 'absolute');
+  $('#tables').css('bottom', '0px');
+  $('#tables').css('overflow-y', 'scroll');
+}
+
+var clipboardDiv = null;
+
+function copyToClipboard(text) {
+    if (!clipboardDiv) {
+        clipboardDiv = $('<div />', {
+            css: {
+                'position':'absolute',
+                'left':'30%',
+                'top':'30%',
+                'background-color':'#dfd',
+                'border':'solid black',
+                'border-width':'1px',
+                'padding':'10px',
+                'display':'none'
+            }
+        }).appendTo($('body'));
+    }
+    clipboardDiv.html('Copied "<span>' + text + '</span>" to clipboard');
+    clipboardDiv.show();
+    document.getSelection().selectAllChildren(clipboardDiv.children('span')[0]);
+    document.execCommand('copy');
+    window.setTimeout(function() {clipboardDiv.fadeOut(500)}, 2000);
+}
+
+function copy(e) {
+  copyToClipboard($(this).attr('data-colname'))
+}
+
+function init() {
+  var url = 'http://dotmaptiles-staging.createlab.org/data/acs2016_5year_tract2010.json';
+  console.log('Requesting json from ' + url);
+  $.ajax({
+    url: url,
+    success: load
+  });
+  $('input[name=columnVisibility]').checkboxradio().change(changeColumnVisibility);
+  $('#filter').on('input', changeFilter);
+  $(window).resize(resize);
+}
+
+$(init);
+</script>
+</head>
+<body>
+<div id="controls">
+  Filter: <input id="filter" type="text" style="width:300px; height:30px"></input>
+  <div id="filterStats" style="margin-top:5px; margin-bottom:5px">...</div>
+  <label for="showColumns">Show table columns</label>
+  <input type="radio" name="columnVisibility" id="showColumns" value="show" checked>
+  <label for="hideColumns">Hide table columns</label>
+  <input type="radio" name="columnVisibility" id="hideColumns" value="hide">
+</div>  
+<div id="tables">
+  <div id="loading">Loading...</div>
+</div>
+</body>
+</html>
