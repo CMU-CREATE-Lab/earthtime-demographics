@@ -1014,15 +1014,19 @@ def show_datasets():
     html += '</body></html>'
     return html
 
+def compute_json_path(dataset):
+    return '{cache_dir}/{dataset}/description.json'.format(cache_dir=cache_dir, **locals())
+
+@app.route('/data/<dataset>.json')
+def dataset_json(dataset):
+    ret = flask.Response(open(compute_json_path(dataset)).read(), mimetype="application/json")
+    ret.headers['Access-Control-Allow-Origin'] = '*'
+    return ret
+
 @app.route('/data/<dataset>')
 def show_dataset_columns(dataset):
-    description = '{cache_dir}/{dataset}/description.html'.format(cache_dir=cache_dir, **locals())
-    html = '<html><head></head><body>'
-    html += '<a href="../data">Back to all datasets</a><br>'
-    if os.path.exists(description):
-        html += open(description).read()
-        html += '</body></html>'
-        return html
+    if os.path.exists(compute_json_path(dataset)):
+        return open('description.html').read()
     try:
         columns = list_columns(dataset)
         if dataset == 'census2000_block2010':

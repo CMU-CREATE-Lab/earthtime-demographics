@@ -148,7 +148,8 @@ function copy(e) {
 }
 
 function init() {
-  var url = 'http://dotmaptiles-staging.createlab.org/data/acs2016_5year_tract2010.json';
+  var urlNodes = document.URL.split('/');
+  var url = urlNodes[urlNodes.length - 1] + '.json';
   console.log('Requesting json from ' + url);
   $.ajax({
     url: url,
@@ -164,6 +165,7 @@ $(init);
 </head>
 <body>
 <div id="controls">
+  <div style="margin-bottom:3px"><a href="../data">Back to all datasets</a><br></div>
   Filter: <input id="filter" type="text" style="width:300px; height:30px"></input>
   <div id="filterStats" style="margin-top:5px; margin-bottom:5px">...</div>
   <label for="showColumns">Show table columns</label>
