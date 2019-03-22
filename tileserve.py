@@ -1042,6 +1042,13 @@ def show_dataset_columns(dataset):
         print traceback.format_exc()
         raise
 
+@app.route('/data/<dataset>/<column>.float32')
+def serve_column_float32(dataset, column):
+    data = load_column(dataset, column)
+    ret = flask.Response(data.tobytes(), mimetype="application/octet-stream")
+    ret.headers['Access-Control-Allow-Origin'] = '*'
+    return ret
+
 @app.route('/')
 def hello():
     return """
