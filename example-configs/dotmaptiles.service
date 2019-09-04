@@ -1,0 +1,24 @@
+[Unit]
+Description=dotmaptiles
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=earthtimeserve
+
+Environment='PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' \
+'PYTHONPATH=/t/tm4.dotmaptiles.createlab.org/earthtime-demographics'
+
+ExecStart=/usr/local/bin/uwsgi \
+   --http-socket=127.0.0.1:5000 \
+   --touch-reload /t/tm4.dotmaptiles.createlab.org/earthtime-demographics/tileserve.py \
+   --wsgi-file /t/tm4.dotmaptiles.createlab.org/earthtime-demographics/tileserve.py \
+   --callable app \
+   --logto /var/log/dotmaptiles.log \
+   --processes=4
+
+Restart=always
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target
