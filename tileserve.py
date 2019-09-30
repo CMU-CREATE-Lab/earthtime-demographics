@@ -4,12 +4,14 @@ import sys, traceback
 
 from urllib2 import parse_http_list as _parse_list_header
 
-import ast, datetime, flask, functools, glob, gzip, hashlib, json, math, md5, numpy, os, psycopg2, random, resource, re
+import ast, datetime, flask, functools, glob, gzip, hashlib, json, math, md5, numpy, os, psycopg2, random, re, requests, resource
 import scipy.misc, StringIO, struct, subprocess, sys, tempfile, threading, time, urlparse
 
 from dateutil import tz
 from flask import after_this_request, request
 from cStringIO import StringIO as IO
+
+from sqlitedict import SqliteDict
 
 def cputime_ms():
     resources = resource.getrusage(resource.RUSAGE_SELF)
@@ -40,8 +42,12 @@ def exec_ipynb(filename_or_url):
         exec '\n'.join([''.join(cell['input']) for cell in jsonNb['worksheets'][0]['cells'] if cell['cell_type'] == 'code']) in globals()
 
 exec_ipynb('timelapse-utilities.ipynb')
+exec_ipynb('docs-proxy-flask/transform-earthtime-sheets.ipynb')
 
 set_default_psql_database('census2010')
+
+dotmap_layerdef_table_name = 'dotmap_layerdefs'
+dotmap_layerdef_path = 'dotmap_layerdefs.db'
 
 app = flask.Flask(__name__)
 
@@ -764,7 +770,6 @@ def generate_tile_data_pixmap(layer, z, x, y, tile_width_in_pixels, format):
 
     if format == 'box':
         tile_data = numpy.zeros((len(layer['colors_rgba8']), tile_width_in_pixels, tile_width_in_pixels), dtype=numpy.uint8)
-        print('about to compute_tile_data_box ', layer['colors_rgba8'])
         if incount > 0:
             status = compute_tile_data_box(prototile_path, incount, tile_data, tile_width_in_pixels,
                                            layer['populations'],
@@ -775,7 +780,6 @@ def generate_tile_data_pixmap(layer, z, x, y, tile_width_in_pixels, format):
     else:
         bytes_per_pixel = 4 # RGBA x 8-bit
         tile_data = numpy.zeros((tile_width_in_pixels, tile_width_in_pixels, bytes_per_pixel), dtype=numpy.uint8)
-        print('about to compute_tile_data_png ', layer['colors_rgba8'])
         if incount > 0:
             status = compute_tile_data_png(prototile_path, incount, tile_data, tile_width_in_pixels,
                                            layer['populations'], layer['colors_rgba8'],
@@ -946,7 +950,12 @@ def serve_tile_v1_png(layerdef, z, x, y):
     response.headers['Access-Control-Allow-Origin'] = '*'
     return response
 
-# .box is the new tile format
+
+def generate_tile_data_tbox(layers, z, x, y, tile_width_in_pixels):
+    frames = [generate_tile_data_png_or_box(layer, z, x, y, tile_width_in_pixels, 'box') for layer in layers]
+    return b''.join(frames)
+
+# .box V1 (single frame)
 @app.route('/tilesv1/<layerdef>/<z>/<x>/<y>.box')
 @gzipped
 def serve_tile_v1_box(layerdef, z, x, y):
@@ -964,17 +973,60 @@ def serve_tile_v1_box(layerdef, z, x, y):
     response.headers['Access-Control-Allow-Origin'] = '*'
     return response
 
+# .box V2 (single frame)
+@app.route('/tilesv2/<layername>/<z>/<x>/<y>.box')
+@gzipped
+def serve_tile_v2_box(layername, z, x, y):
+    dotmap_dict = SqliteDict(dotmap_layerdef_path, flag='c',
+                             tablename=dotmap_layerdef_table_name,
+                             autocommit=False)
+    return serve_tile_v1_box(dotmap_dict[layername], z, x, y)
+
+# .tbox V1 (animated)
+@app.route('/tilesv1/<layerdefs>/<z>/<x>/<y>.tbox')
+@gzipped
+def serve_tile_v1_tbox(layerdefs, z, x, y):
+    try:
+        if isinstance(layerdefs, list):
+            layers = layerdefs
+        else:
+            layers = [find_or_generate_layer(layerdef) for layerdef in layerdefs.split(';;;')]
+        tile_width_in_pixels = 256
+        tile = generate_tile_data_tbox(layers, z, x, y, tile_width_in_pixels)
+        
+        response = flask.Response(tile, mimetype='application/octet-stream')
+    except InvalidUsage, e:
+        response = flask.Response('<h2>400 Invalid Usage</h2>' + e.message, status=400)
+    except:
+        print traceback.format_exc()
+        raise
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    return response
+
+# .tbox V2 (animated)
+@app.route('/tilesv2/<layername>/<z>/<x>/<y>.tbox')
+@gzipped
+def serve_tile_v2_tbox(layername, z, x, y):
+    dotmap_dict = SqliteDict(dotmap_layerdef_path, flag='c',
+                             tablename=dotmap_layerdef_table_name,
+                             autocommit=False)
+        
+    frame_layernames = dotmap_dict[layername].split('|')
+    print('serving tbox: layer %s expands to frames %s' % (layername, frame_layernames))
+
+    layers = [find_or_generate_layer(dotmap_dict[frame_layername]) for frame_layername in frame_layernames]
+    
+    return serve_tile_v1_tbox(layers, z, x, y)
+
 # .bin is the first tile format, with every point enumerated, vector-style
 @app.route('/tilesv1/<layerdef>/<z>/<x>/<y>.<suffix>')
 @gzipped
 def serve_tile_v1(layerdef, z, x, y, suffix):
+    assert(suffix != 'box')
     try:
         layer = find_or_generate_layer(layerdef)
-        if suffix == 'box':
-            tile = generate_tile_data_box(layer, z, x, y)
-        else:
-            tile = generate_tile_data(layer, z, x, y, use_c=True)
-            outcount = len(tile) / tile_record_len
+        tile = generate_tile_data(layer, z, x, y, use_c=True)
+        outcount = len(tile) / tile_record_len
         
         if suffix == 'debug':
             html = '<html><head></head><body>'
@@ -1073,3 +1125,60 @@ if __name__ == '__main__':
         print response.status_code
         print response.get_data()
         
+@app.route('/reload-layers')
+def reload_layers():
+    # Create a persistent table for dotmap layerdefs
+    dotmap_dict = SqliteDict(dotmap_layerdef_path, flag='c',
+                             tablename=dotmap_layerdef_table_name,
+                             autocommit=False)
+
+    # This points to the default version of the layer sheet.  Be aware that anyone
+    # using non-standard dotmap sheet, or anyone modifying the default sheet without
+    # calling reload-layers will not get what they want.
+    dotmap_url = 'https://docs.google.com/spreadsheets/d/1rCiksJv4aXi1usI0_9zdl4v5vuOfiHgMRidiDPt1WfE/edit#gid=358696896'
+
+    dotmap_df = read_csv_url(dotmap_url)
+
+    # Calculate column names
+    col_count = 10
+
+    color_colnames = ['Color%d'%(i) for i in range(1, col_count+1)]
+    def_colnames = ['Definition%d'%(i) for i in range(1, col_count+1)]
+    for i in range(0,col_count):
+        if (not color_colnames[i] in dotmap_df.columns or
+            not def_colnames[i] in dotmap_df.columns):
+            col_count = i
+            break
+        
+    # For each row in dotmap_df, extract all the non-empty colors into a string
+    for idx in dotmap_df.index:
+        layer_id = dotmap_df.at[idx,'Share link identifier']
+        anim_str = dotmap_df.at[idx,'AnimationLayers']
+
+        if not pd.isna(anim_str) and not anim_str=='':
+            # This is an animation layer, store anim_str
+            # in dotmap_dict
+            dotmap_dict[layer_id] = anim_str
+            break
+
+        # Not an animiation layer, put together the color and definition fields
+        ldef_arr = []
+        for i in range(0, col_count):
+            color_str = dotmap_df.at[idx,color_colnames[i]]
+            def_str =   dotmap_df.at[idx,def_colnames[i]]
+            if pd.isna(color_str) or pd.isna(def_str) or color_str == '' or def_str == '':
+                # We're done here
+                break
+
+            # Extend ldef_arr
+            ldef_arr.append('%s;%s'%(color_str,def_str))
+
+        # Join the ldef elements from each set of color/definitions
+        # for this layer into a single string
+        ldef_str = ';;'.join(ldef_arr)
+        dotmap_dict[layer_id] = ldef_str
+        
+    # Save results persistently into dotmap_dict
+    dotmap_dict.commit()
+
+    return flask.Response('%d layers loaded successfully!' % (len(dotmap_df)))
