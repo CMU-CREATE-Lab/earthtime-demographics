@@ -1159,7 +1159,7 @@ def reload_layers():
             # This is an animation layer, store anim_str
             # in dotmap_dict
             dotmap_dict[layer_id] = anim_str
-            break
+            continue
 
         # Not an animiation layer, put together the color and definition fields
         ldef_arr = []
