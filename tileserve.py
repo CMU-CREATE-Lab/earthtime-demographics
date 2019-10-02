@@ -1083,14 +1083,16 @@ def show_dataset_columns(dataset):
     if os.path.exists(compute_json_path(dataset)):
         return open('description.html').read()
     try:
+        html = []
         columns = list_columns(dataset)
         if dataset == 'census2000_block2010':
             columns = [c for c in columns if c == c.upper()]
-        html += '<h1>Columns in dataset {dataset}:</h1>\n'.format(**locals())
+        html.append('<a href="../data">Back to all datasets</a><br>')
+        html.append('<h1>Columns in dataset {dataset}:</h1>'.format(**locals()))
         for col in columns:
-            html += '{col}<br>\n'.format(**locals())
-        html += '</body></html>'
-        return html
+            html.append('{col}<br>'.format(**locals()))
+        html.append('</body></html>')
+        return '\n'.join(html)
     except InvalidUsage, e:
         return flask.Response('<h2>400 Invalid Usage</h2>' + e.message, status=400)
     except:
