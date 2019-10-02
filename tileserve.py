@@ -4,7 +4,7 @@ import sys, traceback
 
 from urllib2 import parse_http_list as _parse_list_header
 
-import ast, datetime, flask, functools, glob, gzip, hashlib, json, math, md5, numpy, os, psycopg2, random, re, requests, resource
+import ast, cgi, datetime, flask, functools, glob, gzip, hashlib, json, math, md5, numpy, os, psycopg2, random, re, requests, resource
 import scipy.misc, StringIO, struct, subprocess, sys, tempfile, threading, time, urlparse
 
 from dateutil import tz
@@ -980,7 +980,10 @@ def serve_tile_v2_box(layername, z, x, y):
     dotmap_dict = SqliteDict(dotmap_layerdef_path, flag='c',
                              tablename=dotmap_layerdef_table_name,
                              autocommit=False)
-    return serve_tile_v1_box(dotmap_dict[layername], z, x, y)
+    if layername in dotmap_dict:
+        return serve_tile_v1_box(dotmap_dict[layername], z, x, y)
+    else:
+        return flask.Response('<h2>404 Cannot find layer named %s in local database</h2>Consider running reload-layers.' % cgi.escape(layername), status=404)
 
 # .tbox V1 (animated)
 @app.route('/tilesv1/<layerdefs>/<z>/<x>/<y>.tbox')
