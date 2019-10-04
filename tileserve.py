@@ -252,7 +252,7 @@ def load_column(dataset, column):
     if not os.path.exists(cache_filename):
         if not os.path.exists(cache_filename_prefix + '.numpy'):
             abort400(html='Column named "{column}" in dataset "{dataset}" not found.<br><br><a href="{dataroot}/{dataset}">List valid columns from {dataset}</a>'.format(
-                dataroot=cgi.escape(dataroot()), dataset=cgi.escape(dataset)))
+                column=cgi.escape(column), dataroot=cgi.escape(dataroot()), dataset=cgi.escape(dataset)))
         data = numpy.load(open(cache_filename_prefix + '.numpy')).astype(numpy.float32)
         tmpfile = cache_filename + '.tmp.%d.%d' % (os.getpid(), threading.current_thread().ident)
         data.tofile(tmpfile)
