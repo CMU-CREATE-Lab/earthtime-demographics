@@ -10,6 +10,7 @@ import scipy.misc, StringIO, struct, subprocess, sys, tempfile, threading, time,
 from dateutil import tz
 from flask import after_this_request, request
 from cStringIO import StringIO as IO
+from werkzeug.exceptions import BadRequest, abort
 
 from sqlitedict import SqliteDict
 
@@ -90,6 +91,16 @@ def gzipped(f):
     
     return view_func
 
+# msg will be html-escaped, or use html= to send raw html
+def abort400(msg=None, html=None):
+    if msg and html:
+        raise Exception('abort400 should specify eithier msg or html, not both')
+    if msg:
+        html = cgi.escape(msg)
+    response = flask.Response('<h2>400: Invalid request</h2>%s' % html, status=400)
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    abort(response)
+
 # packs to the range 0 ... 256^3-1
 def unpack_color(f):
     b = floor(f / 256.0 / 256.0)
@@ -125,7 +136,7 @@ def parse_color(color, encoding=numpy.float32):
                                encoding)
     except:
         pass
-    raise InvalidUsage('Cannot parse color <code><b>%s</b></code> from spreadsheet.<br><br>Color must be in standard web form, <code><b>#RRGGBB</b></code>, where RR, GG, and BB are each two-digit hexadecimal numbers between 00 and FF.<br><br>See <a href="https://www.w3schools.com/colors/colors_picker.asp">HTML Color Picker</a>' % color)
+    abort400(html='Cannot parse color <code><b>%s</b></code> from spreadsheet.<br><br>Color must be in standard web form, <code><b>#RRGGBB</b></code>, where RR, GG, and BB are each two-digit hexadecimal numbers between 00 and FF.<br><br>See <a href="https://www.w3schools.com/colors/colors_picker.asp">HTML Color Picker</a>' % color)
 
 def parse_colors(colors, encoding=numpy.float32):
     packed = [parse_color(color, encoding) for color in colors]
@@ -177,10 +188,6 @@ def query_psql(query, quiet=False, database=None):
         sys.stdout.write('Execution of %s\ntook %g seconds and returned %d rows\n' % (query.strip(), elapsed, len(rows)))
     return rows
 
-class InvalidUsage(Exception):
-    def __init__(self, message):
-        self.message = message
-
 cache_dir = 'columncache'
 
 def list_datasets():
@@ -193,8 +200,8 @@ def dataroot():
 def list_columns(dataset):
     dir = '{cache_dir}/{dataset}'.format(cache_dir=cache_dir, **locals())
     if not os.path.exists(dir):
-        msg = 'Dataset named "{dataset}" not found.<br><br><a href="{dataroot}">List valid datasets</a>'.format(dataroot=dataroot(), **locals())
-        raise InvalidUsage(msg)
+        abort400(html = 'Dataset named "{dataset}" not found.<br><br><a href="{dataroot}">List valid datasets</a>'.format(
+            dataroot=cgi.escape(dataroot()), dataset=cgi.escape(dataset)))
     return sorted([os.path.basename(os.path.splitext(c)[0]) for c in (glob.glob(dir + '/*.float32') + glob.glob(dir + '/*.numpy'))])
 
 # Removing the least recent takes O(N) time;  could be make more efficient if needed for larger dicts
@@ -238,17 +245,14 @@ def load_column(dataset, column):
         return column_cache.get(cache_key)
     dir = '{cache_dir}/{dataset}'.format(cache_dir=cache_dir, **locals())
     if not os.path.exists(dir):
-        msg = 'Dataset named "{dataset}" not found.<br><br><a href="{dataroot}">List valid datasets</a>'.format(dataroot=dataroot(), **locals())
-        raise InvalidUsage(msg)
+        abort400(html='Dataset named "{dataset}" not found.<br><br><a href="{dataroot}">List valid datasets</a>'.format(
+            dataroot=cgi.escape(dataroot()), dataset=cgi.escape(dataset)))
     cache_filename_prefix = dir + '/' + column
     cache_filename = cache_filename_prefix + '.float32'
     if not os.path.exists(cache_filename):
         if not os.path.exists(cache_filename_prefix + '.numpy'):
-            msg = ('Column named "{column}" in dataset "{dataset}" not found.<br><br>'
-                   '<a href="{dataroot}/{dataset}">List valid columns from {dataset}</a>').format(
-                dataroot=dataroot(), **locals())
-                   
-            raise InvalidUsage(msg)
+            abort400(html='Column named "{column}" in dataset "{dataset}" not found.<br><br><a href="{dataroot}/{dataset}">List valid columns from {dataset}</a>'.format(
+                dataroot=cgi.escape(dataroot()), dataset=cgi.escape(dataset)))
         data = numpy.load(open(cache_filename_prefix + '.numpy')).astype(numpy.float32)
         tmpfile = cache_filename + '.tmp.%d.%d' % (os.getpid(), threading.current_thread().ident)
         data.tofile(tmpfile)
@@ -284,13 +288,12 @@ def eval_(node):
     elif isinstance(node, ast.Call):
         func_name = node.func.id
         if not func_name in functions:
-            raise InvalidUsage('Function {func_name} does not exist.  Valid functions are '.format(**locals()) +
-                               ', '.join(sorted(functions.keys())))
+            abort400('Function {func_name} does not exist.  Valid functions are '.format(**locals()) +
+                     ', '.join(sorted(functions.keys())))
         return apply(functions[func_name], [eval_(arg) for arg in node.args])
     elif isinstance(node, ast.Attribute):
         return load_column(node.value.id, node.attr)
-    raise InvalidUsage('cannot parse %s' % ast.dump(node))
-
+    abort400('cannot parse %s' % ast.dump(node))
 
 expression_cache = LruDict(50) # 
 
@@ -306,7 +309,7 @@ def eval_layer_column(expr):
             expr = expr.replace(' DIV ', '/')
             data = eval_(ast.parse(expr, mode='eval').body).astype(numpy.float32)
         except SyntaxError,e:
-            raise InvalidUsage('<pre>' + traceback.format_exc(0) + '</pre>')
+            abort400(html = '<pre>' + cgi.escape(traceback.format_exc(0)) + '</pre>')
         
         try:
             os.mkdir('expression_cache')
@@ -925,8 +928,6 @@ def serve_video_tile_v1_mp4(layersdef, z, x, y):
         
         #response = flask.Response(tile, mimetype='video/mp4')
         response = flask.Response(tile, mimetype='video/webm')
-    except InvalidUsage, e:
-        response = flask.Response('<h2>400 Invalid Usage</h2>' + e.message, status=400)
     except:
         print traceback.format_exc()
         raise
@@ -942,18 +943,23 @@ def serve_tile_v1_png(layerdef, z, x, y):
         outcount = len(tile) / tile_record_len
         
         response = flask.Response(tile, mimetype='image/png')
-    except InvalidUsage, e:
-        response = flask.Response('<h2>400 Invalid Usage</h2>' + e.message, status=400)
     except:
         print traceback.format_exc()
         raise
     response.headers['Access-Control-Allow-Origin'] = '*'
     return response
 
-
 def generate_tile_data_tbox(layers, z, x, y, tile_width_in_pixels):
     frames = [generate_tile_data_png_or_box(layer, z, x, y, tile_width_in_pixels, 'box') for layer in layers]
     return b''.join(frames)
+
+def get_layerdef(layername):
+    dotmap_dict = SqliteDict(dotmap_layerdef_path, flag='c',
+                             tablename=dotmap_layerdef_table_name,
+                             autocommit=False)
+    if not layername in dotmap_dict:
+        abort400('Cannot find layer named "%s" in local database (consider running reload-layers.)' % layername)
+    return dotmap_dict[layername]
 
 # .box V1 (single frame)
 @app.route('/tilesv1/<layerdef>/<z>/<x>/<y>.box')
@@ -965,8 +971,6 @@ def serve_tile_v1_box(layerdef, z, x, y):
         tile = generate_tile_data_png_or_box(layer, z, x, y, tile_width_in_pixels, 'box')
         
         response = flask.Response(tile, mimetype='application/octet-stream')
-    except InvalidUsage, e:
-        response = flask.Response('<h2>400 Invalid Usage</h2>' + e.message, status=400)
     except:
         print traceback.format_exc()
         raise
@@ -980,10 +984,7 @@ def serve_tile_v2_box(layername, z, x, y):
     dotmap_dict = SqliteDict(dotmap_layerdef_path, flag='c',
                              tablename=dotmap_layerdef_table_name,
                              autocommit=False)
-    if layername in dotmap_dict:
-        return serve_tile_v1_box(dotmap_dict[layername], z, x, y)
-    else:
-        return flask.Response('<h2>404 Cannot find layer named %s in local database</h2>Consider running reload-layers.' % cgi.escape(layername), status=404)
+    return serve_tile_v1_box(get_layerdef(layername), z, x, y)
 
 # .tbox V1 (animated)
 @app.route('/tilesv1/<layerdefs>/<z>/<x>/<y>.tbox')
@@ -998,8 +999,6 @@ def serve_tile_v1_tbox(layerdefs, z, x, y):
         tile = generate_tile_data_tbox(layers, z, x, y, tile_width_in_pixels)
         
         response = flask.Response(tile, mimetype='application/octet-stream')
-    except InvalidUsage, e:
-        response = flask.Response('<h2>400 Invalid Usage</h2>' + e.message, status=400)
     except:
         print traceback.format_exc()
         raise
@@ -1010,14 +1009,10 @@ def serve_tile_v1_tbox(layerdefs, z, x, y):
 @app.route('/tilesv2/<layername>/<z>/<x>/<y>.tbox')
 @gzipped
 def serve_tile_v2_tbox(layername, z, x, y):
-    dotmap_dict = SqliteDict(dotmap_layerdef_path, flag='c',
-                             tablename=dotmap_layerdef_table_name,
-                             autocommit=False)
-        
-    frame_layernames = dotmap_dict[layername].split('|')
+    frame_layernames = get_layerdef(layername).split('|')
     print('serving tbox: layer %s expands to frames %s' % (layername, frame_layernames))
 
-    layers = [find_or_generate_layer(dotmap_dict[frame_layername]) for frame_layername in frame_layernames]
+    layers = [find_or_generate_layer(get_layerdef(frame_layername)) for frame_layername in frame_layernames]
     
     return serve_tile_v1_tbox(layers, z, x, y)
 
@@ -1046,9 +1041,7 @@ def serve_tile_v1(layerdef, z, x, y, suffix):
         elif suffix == 'bin':
             response = flask.Response(tile[0 : outcount * tile_record_len], mimetype='application/octet-stream')
         else:
-            raise InvalidUsage('Invalid suffix {suffix}'.format(**locals()))
-    except InvalidUsage, e:
-        response = flask.Response('<h2>400 Invalid Usage</h2>' + e.message, status=400)
+            abort400('Invalid suffix {suffix}'.format(**locals()))
     except:
         print traceback.format_exc()
         if suffix == 'debug':
@@ -1093,8 +1086,6 @@ def show_dataset_columns(dataset):
             html.append('{col}<br>'.format(**locals()))
         html.append('</body></html>')
         return '\n'.join(html)
-    except InvalidUsage, e:
-        return flask.Response('<h2>400 Invalid Usage</h2>' + e.message, status=400)
     except:
         print traceback.format_exc()
         raise
