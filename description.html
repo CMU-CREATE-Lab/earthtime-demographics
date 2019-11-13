@@ -63,7 +63,9 @@ function load(x) {
     for (var j = 0; j < table.columns.length; j++) {
       html.push('<div class="column">');
       var column = table.columns[j];
-      var columnName = x.name + '.' + table.name + column[0];
+      var columnName = x.name + '.' + table.name;
+      if (x.name.startsWith('acs')) columnName += '_';
+      columnName += column[0];
       html.push('<p><button data-colname="' + columnName + '">copy</button> ');
       html.push('Column ' + column[0] + ' &nbsp;&nbsp; <em>' + column[1] + '</em></p>')
       search.push(columnName);
