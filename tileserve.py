@@ -1,18 +1,16 @@
-#!/usr/bin/env python
-
-import sys, traceback
-
-from urllib2 import parse_http_list as _parse_list_header
-
-import ast, cgi, datetime, flask, functools, glob, gzip, hashlib, json, math, md5, numpy, os, psycopg2, random, re, requests, resource
-import scipy.misc, StringIO, struct, subprocess, sys, tempfile, threading, time, urlparse
+import ast, ctypes, datetime, flask, functools, glob, gzip, hashlib, html, imageio, io, json, math, os
+import psycopg2, resource, sqlalchemy, struct, subprocess, sys, threading, time, traceback
 
 from dateutil import tz
-from flask import after_this_request, request
-from cStringIO import StringIO as IO
-from werkzeug.exceptions import BadRequest, abort
-
+from flask import after_this_request, request, g
+from werkzeug.exceptions import abort
 from sqlitedict import SqliteDict
+from tileserver_utils import compile_and_load, to_ctype_reference, read_csv_url
+import numpy as np
+import pandas as pd
+from utils import epsql
+engine = epsql.Engine()
+
 
 def cputime_ms():
     resources = resource.getrusage(resource.RUSAGE_SELF)
@@ -21,36 +19,64 @@ def cputime_ms():
 def vmsize_gb():
     return float([l for l in open('/proc/%d/status' % os.getpid()).readlines() if l.startswith('VmSize:')][0].split()[1])/1e6
 
+
 def log(msg):
     date = datetime.datetime.now(tz.tzlocal()).strftime('%Y-%m-%d %H:%M:%S%z')
-    logfile.write('%s %5d %.3fGB: %s\n' % (date, os.getpid(), vmsize_gb(), msg))
+    req = '%5d' % os.getpid()
+    try:
+        if g.requestno:
+            req += ':%05d' % g.requestno
+    except:
+        pass
+    mem =  '%.3fGB' % vmsize_gb()
+    logfile.write(f'{date} {req} {mem}: {msg}\n')
     logfile.flush()
 
 # Choose logfile by running uwsgi with --logto PATH
 logfile = sys.stderr
 
+print('Python version: ', sys.version)
+
 if '__file__' in globals():
     log('Starting, path ' + os.path.abspath(__file__))
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
-def exec_ipynb(filename_or_url):
-    nb = (urllib2.urlopen(filename_or_url) if re.match(r'https?:', filename_or_url) else open(filename_or_url)).read()
-    jsonNb = json.loads(nb)
-    #check for the modified formatting of Jupyter Notebook v4
-    if(jsonNb['nbformat'] == 4):
-        exec '\n'.join([''.join(cell['source']) for cell in jsonNb['cells'] if cell['cell_type'] == 'code']) in globals()
-    else:
-        exec '\n'.join([''.join(cell['input']) for cell in jsonNb['worksheets'][0]['cells'] if cell['cell_type'] == 'code']) in globals()
+containing_dir = os.path.basename(os.path.dirname(os.path.abspath(__file__))) 
+is_production = containing_dir == 'dotmaptiles-production-server'
+if is_production:
+    dotmaptiles_table = "dotmaptiles_production"
+else:
+    dotmaptiles_table = "dotmaptiles_staging"
+log(f'Containing dir {containing_dir}, is_production={is_production}, dotmaptiles_table={dotmaptiles_table}')
 
-exec_ipynb('timelapse-utilities.ipynb')
-exec_ipynb('docs-proxy-flask/transform-earthtime-sheets.ipynb')
-
-set_default_psql_database('census2010')
-
-dotmap_layerdef_table_name = 'dotmap_layerdefs'
-dotmap_layerdef_path = 'dotmap_layerdefs.db'
+if not engine.table_exists(dotmaptiles_table):
+    log(f'{dotmaptiles_table} does not exist, creating...')
+    engine.execute(f"""
+        CREATE TABLE {dotmaptiles_table} (
+            layer_id text primary key,
+            layerdef text,
+            drawopts jsonb
+        );""", verbose=True)
 
 app = flask.Flask(__name__)
+
+requestno_lock = threading.Lock()
+requestno = 0
+
+@app.before_request
+def handle_before_request_log():
+    with requestno_lock:
+        global requestno
+        requestno += 1
+        g.requestno = requestno
+    log(f'START REQUEST {request.url}')
+
+@app.teardown_request
+def handle_teardown_request_log(exception):
+    msg = 'END REQUEST'
+    if exception:
+        msg += f', exception={exception}'
+    log(msg)
 
 def gzipped(f):
     @functools.wraps(f)
@@ -70,7 +96,7 @@ def gzipped(f):
                 return response
             nbytes = len(response.data)
             start_time = time.time()
-            gzip_buffer = IO()
+            gzip_buffer = io.BytesIO()
             gzip_file = gzip.GzipFile(mode='wb',
                                       fileobj=gzip_buffer,
                                       compresslevel=1)
@@ -79,38 +105,38 @@ def gzipped(f):
             
             response.data = gzip_buffer.getvalue()
             duration = int(1000 * (time.time() - start_time))
-            print '{duration}ms to gzip {nbytes} bytes'.format(**locals())
+            print(f'{duration}ms to gzip {nbytes} bytes')
 
             response.headers['Content-Encoding'] = 'gzip'
             response.headers['Vary'] = 'Accept-Encoding'
             response.headers['Content-Length'] = len(response.data)
             
             return response
-        
+        zipper
         return f(*args, **kwargs)
     
     return view_func
 
 # msg will be html-escaped, or use html= to send raw html
-def abort400(msg=None, html=None):
-    if msg and html:
-        raise Exception('abort400 should specify eithier msg or html, not both')
+def abort400(msg=None, html_msg=None):
+    if msg and html_msg:
+        raise Exception('abort400 should specify eithier msg or html_msg, not both')
     if msg:
-        html = cgi.escape(msg)
-    response = flask.Response('<h2>400: Invalid request</h2>%s' % html, status=400)
+        html_msg = html.escape(msg)
+    response = flask.Response('<h2>400: Invalid request</h2>%s' % html_msg, status=400)
     response.headers['Access-Control-Allow-Origin'] = '*'
     abort(response)
 
 # packs to the range 0 ... 256^3-1
 def unpack_color(f):
-    b = floor(f / 256.0 / 256.0)
-    g = floor((f - b * 256.0 * 256.0) / 256.0)
-    r = floor(f - b * 256.0 * 256.0 - g * 256.0)
+    b = math.floor(f / 256.0 / 256.0)
+    g = math.floor((f - b * 256.0 * 256.0) / 256.0)
+    r = math.floor(f - b * 256.0 * 256.0 - g * 256.0)
     return {'r':r,'g':g,'b':b}
 
-def pack_color(color, encoding=numpy.float32):
-    if encoding == numpy.float32:
-        return color['r'] + color['g'] * 256.0 + color['b'] * 256.0 * 256.0;
+def pack_color(color, encoding=np.float32):
+    if encoding == np.float32:
+        return color['r'] + color['g'] * 256.0 + color['b'] * 256.0 * 256.0
     else:
         # Return with alpha = 255
         # Correct for PNG
@@ -118,7 +144,7 @@ def pack_color(color, encoding=numpy.float32):
         # Trying for MP4
         #return 0xff000000 + color['r'] * 0x10000 + color['g'] * 0x100 + color['b']
 
-def parse_color(color, encoding=numpy.float32):
+def parse_color(color, encoding=np.float32):
     color = color.strip()
     c = color
     try:
@@ -138,9 +164,9 @@ def parse_color(color, encoding=numpy.float32):
         pass
     abort400(html='Cannot parse color <code><b>%s</b></code> from spreadsheet.<br><br>Color must be in standard web form, <code><b>#RRGGBB</b></code>, where RR, GG, and BB are each two-digit hexadecimal numbers between 00 and FF.<br><br>See <a href="https://www.w3schools.com/colors/colors_picker.asp">HTML Color Picker</a>' % color)
 
-def parse_colors(colors, encoding=numpy.float32):
+def parse_colors(colors, encoding=np.float32):
     packed = [parse_color(color, encoding) for color in colors]
-    return numpy.array(packed, dtype = encoding)
+    return np.array(packed, dtype = encoding)
 
 color3dark1 = parse_colors(['#1b9e77','#d95f02','#7570b3'])
 color3dark2 = parse_colors(['#66c2a5','#fc8d62','#8da0cb'])
@@ -198,10 +224,9 @@ def dataroot():
     return '../' * len(request.path.split('/')) + 'data'
 
 def list_columns(dataset):
-    dir = '{cache_dir}/{dataset}'.format(cache_dir=cache_dir, **locals())
+    dir = f'{cache_dir}/{dataset}'
     if not os.path.exists(dir):
-        abort400(html = 'Dataset named "{dataset}" not found.<br><br><a href="{dataroot}">List valid datasets</a>'.format(
-            dataroot=cgi.escape(dataroot()), dataset=cgi.escape(dataset)))
+        abort400(html = f'Dataset named "{html.escape(dataset)}" not found.<br><br><a href="{html.escape(dataroot())}">List valid datasets</a>')
     return sorted([os.path.basename(os.path.splitext(c)[0]) for c in (glob.glob(dir + '/*.float32') + glob.glob(dir + '/*.numpy'))])
 
 # Removing the least recent takes O(N) time;  could be make more efficient if needed for larger dicts
@@ -227,8 +252,8 @@ class LruDict:
         self.entries[key] = {'data':val}
         self.use(key)
         if len(self.entries) > self.max_entries:
-            lru_key, lru_val = None, None
-            for key, val in self.entries.iteritems():
+            lru_key, lru_val = None, {}
+            for key, val in self.entries.items():
                 if not lru_val or val['lastuse'] < lru_val['lastuse']:
                     lru_key, lru_val = key, val
             if lru_val:
@@ -237,23 +262,23 @@ class LruDict:
 column_cache = LruDict(100) # max entries
 
 def map_as_array(path):
-    return numpy.memmap(path, dtype=numpy.float32, mode='r')
+    return np.memmap(path, dtype=np.float32, mode='r')
+
 
 def load_column(dataset, column):
-    cache_key = '{dataset}.{column}'.format(**locals())
+    cache_key = f'{dataset}.{column}'
     if column_cache.has(cache_key):
         return column_cache.get(cache_key)
-    dir = '{cache_dir}/{dataset}'.format(cache_dir=cache_dir, **locals())
+    dir = f'{cache_dir}/{dataset}'
     if not os.path.exists(dir):
-        abort400(html='Dataset named "{dataset}" not found.<br><br><a href="{dataroot}">List valid datasets</a>'.format(
-            dataroot=cgi.escape(dataroot()), dataset=cgi.escape(dataset)))
+        abort400(html=f'Dataset named "{html.escape(dataset)}" not found.<br><br><a href="{html.escape(dataroot())}">List valid datasets</a>')
     cache_filename_prefix = dir + '/' + column
     cache_filename = cache_filename_prefix + '.float32'
     if not os.path.exists(cache_filename):
         if not os.path.exists(cache_filename_prefix + '.numpy'):
-            abort400(html='Column named "{column}" in dataset "{dataset}" not found.<br><br><a href="{dataroot}/{dataset}">List valid columns from {dataset}</a>'.format(
-                column=cgi.escape(column), dataroot=cgi.escape(dataroot()), dataset=cgi.escape(dataset)))
-        data = numpy.load(open(cache_filename_prefix + '.numpy')).astype(numpy.float32)
+            abort400(html=f'''Column named "{html.escape(column)}" in dataset "{html.escape(dataset)}" not found.<br><br>
+                              <a href="{html.escape(dataroot())}/{html.escape(dataset)}">List valid columns from {html.escape(dataset)}</a>''')
+        data = np.load(open(cache_filename_prefix + '.numpy')).astype(np.float32)
         tmpfile = cache_filename + '.tmp.%d.%d' % (os.getpid(), threading.current_thread().ident)
         data.tofile(tmpfile)
         os.rename(tmpfile, cache_filename)
@@ -263,19 +288,19 @@ def load_column(dataset, column):
     return data
 
 binary_operators = {
-    ast.Add:  numpy.add,
-    ast.Sub:  numpy.subtract,
-    ast.Mult: numpy.multiply,
-    ast.Div:  numpy.divide,
+    ast.Add:  np.add,
+    ast.Sub:  np.subtract,
+    ast.Mult: np.multiply,
+    ast.Div:  np.divide,
 }
 
 unary_operators = {
-    ast.USub: numpy.negative, # negation (unary subtraction)
+    ast.USub: np.negative, # negation (unary subtraction)
 }
 
 functions = {
-    'max': numpy.maximum,
-    'min': numpy.minimum,
+    'max': np.maximum,
+    'min': np.minimum,
 }
 
 def eval_(node):
@@ -288,9 +313,9 @@ def eval_(node):
     elif isinstance(node, ast.Call):
         func_name = node.func.id
         if not func_name in functions:
-            abort400('Function {func_name} does not exist.  Valid functions are '.format(**locals()) +
+            abort400(f'Function {func_name} does not exist.  Valid functions are ' +
                      ', '.join(sorted(functions.keys())))
-        return apply(functions[func_name], [eval_(arg) for arg in node.args])
+        return functions[func_name](*[eval_(arg) for arg in node.args])
     elif isinstance(node, ast.Attribute):
         return load_column(node.value.id, node.attr)
     abort400('cannot parse %s' % ast.dump(node))
@@ -298,18 +323,18 @@ def eval_(node):
 expression_cache = LruDict(50) # 
 
 def eval_layer_column(expr):
-    cache_key = hashlib.sha256(expr).hexdigest()
+    cache_key = hashlib.sha256(expr.encode('utf-8')).hexdigest()
     if expression_cache.has(cache_key):
         return expression_cache.get(cache_key)
 
-    cache_filename = 'expression_cache/{cache_key}.float32'.format(**locals())
+    cache_filename = f'expression_cache/{cache_key}.float32'
     
     if not os.path.exists(cache_filename):
         try:
             expr = expr.replace(' DIV ', '/')
-            data = eval_(ast.parse(expr, mode='eval').body).astype(numpy.float32)
-        except SyntaxError,e:
-            abort400(html = '<pre>' + cgi.escape(traceback.format_exc(0)) + '</pre>')
+            data = eval_(ast.parse(expr, mode='eval').body).astype(np.float32)
+        except SyntaxError:
+            abort400(html = '<pre>' + html.escape(traceback.format_exc(0)) + '</pre>')
         
         try:
             os.mkdir('expression_cache')
@@ -325,36 +350,10 @@ def eval_layer_column(expr):
     return data    
 
 #def assemble_cols(cols):
-#    return numpy.hstack([c.reshape(len(c), 1) for c in cols]).astype(numpy.float32)
+#    return np.hstack([c.reshape(len(c), 1) for c in cols]).astype(np.float32)
 
 populations = {}
 colors = {}
-
-def compute_tile_data_python(prototile_path, incount, tile, populations):
-    raise 'Dont call me'
-    prototile = open(prototile_path).read()
-    assert(incount == len(prototile) / prototile_record_len)
-    
-    outcount = 0
-    for i in range(incount):
-        (x, y, blockidx, seq) = struct.unpack_from(prototile_record_format,
-                                                   prototile,
-                                                   i * prototile_record_len)
-        # TODO:
-        # Decide if we want to keep the randomness.
-        # If so, make this deterministic and fast.
-        seq += random.random()
-        #seq += 0.5
-
-        for c in range(populations.shape[1]):
-            seq -= populations[blockidx, c]
-            if seq < 0:
-                struct.pack_into(tile_record_format, tile,
-                                 outcount * tile_record_len,
-                                 x, y, colors[c])
-                outcount += 1
-                break
-    return outcount
 
 compute_tile_data_ext = compile_and_load("""
 #include <stdint.h>
@@ -400,7 +399,10 @@ int compute_tile_data(
     }
 
     int fd = open(prototile_path, O_RDONLY);
-    if (fd < 0) return -1;
+    if (fd < 0) {
+        fprintf(stderr, "Cannot open prototile_path %s for reading\\n", prototile_path);
+        return -1;
+    }
 
     PrototileRecord *p = mmap (0, incount*sizeof(PrototileRecord),
                                PROT_READ, MAP_SHARED, fd, 0);
@@ -653,23 +655,27 @@ int compute_tile_data_png(
 """)
 
 def compute_tile_data_c(prototile_path, incount, tile, populations, colors):
-    assert(populations[0].dtype == numpy.float32)
-    assert(colors.dtype == numpy.float32)
-    return compute_tile_data_ext.compute_tile_data(
-        prototile_path,
+    assert(populations[0].dtype == np.float32)
+    assert(colors.dtype == np.float32)
+
+    ret = compute_tile_data_ext.compute_tile_data(
+        prototile_path.encode('utf-8'),
         int(incount),
         to_ctype_reference(tile),
         len(tile),
         to_ctype_reference(populations),
         populations[0].size, len(populations),
         to_ctype_reference(colors))
+    if ret < 0:
+        raise Exception(f"compute_tile_data_c failed with {ret}, prototile_path={prototile_path}")
+    return ret
 
 def compute_tile_data_png(prototile_path, incount, tile_pixels, tile_width_in_pixels, populations, colors_rgba8,
                           min_x, min_y, max_x, max_y, radius, level, block_areas, prototile_subsample):
-    assert(populations[0].dtype == numpy.float32)
-    assert(colors_rgba8.dtype == numpy.uint32)
+    assert(populations[0].dtype == np.float32)
+    assert(colors_rgba8.dtype == np.uint32)
     return compute_tile_data_ext.compute_tile_data_png(
-        prototile_path,
+        prototile_path.encode('utf-8'),
         int(incount),
         to_ctype_reference(tile_pixels),
         tile_width_in_pixels,
@@ -687,9 +693,9 @@ def compute_tile_data_png(prototile_path, incount, tile_pixels, tile_width_in_pi
 
 def compute_tile_data_box(prototile_path, incount, tile_box_pops, tile_width_in_boxes, populations,
                           min_x, min_y, max_x, max_y, level, block_areas, prototile_subsample):
-    assert(populations[0].dtype == numpy.float32)
+    assert(populations[0].dtype == np.float32)
     return compute_tile_data_ext.compute_tile_data_box(
-        prototile_path,
+        prototile_path.encode('utf-8'),
         int(incount),
         to_ctype_reference(tile_box_pops),
         tile_width_in_boxes,
@@ -703,7 +709,7 @@ def compute_tile_data_box(prototile_path, incount, tile_box_pops, tile_width_in_
         to_ctype_reference(block_areas),
         ctypes.c_float(prototile_subsample))
 
-def generate_tile_data_pixmap(layer, z, x, y, tile_width_in_pixels, format):
+def generate_tile_data_pixmap(layer, z, x, y, tile_width_in_pixels, format, draw_options={}):
     # Load block area column
     block_areas = load_column('geometry_block2010', 'area_web_mercator_sqm')
 
@@ -722,43 +728,61 @@ def generate_tile_data_pixmap(layer, z, x, y, tile_width_in_pixels, format):
         py = int(y / (2 ** (z - max_prototile_level)))
         
     # remove block # and seq #, add color
-    
-    prototile_path = 'prototiles/%d/%d/%d.bin' % (pz, px, py)
+
+    levelSubsample = draw_options.get('levelSubsample', None)
+    if levelSubsample:
+        log('draw_options.levelSubsample exists, using prototiles003')
+        prototile_dir = "prototiles003"
+    else:
+        log('draw_options.levelSubsample does not exist, using prototiles')
+        prototile_dir = "prototiles"
+
+    prototile_path = "%s/%d/%d/%d.bin" % (prototile_dir, pz, px, py)
     incount = os.path.getsize(prototile_path) / prototile_record_len
 
-    # subsampling factors already baked into prototiles, from C02 Generate prototiles.ipynb
+    if levelSubsample:
+        prototile_subsamples = [0] * 11
+        for (level_str, subsample) in json.load(open('%s/subsamples.json' % prototile_dir)).items():
+            prototile_subsamples[int(level_str)] = subsample
 
-    prototile_subsamples = [
-        0.001, # level 0
-        0.001,
-        0.001,
-        0.001,
-        0.001,
-        0.001,
-        0.004,
-        0.016,
-        0.064,
-        0.256,
-        1.0    # level 10
-    ]
-    prototile_subsample = 1
-    if z < len(prototile_subsamples):
-        prototile_subsample = prototile_subsamples[z]
+        log('****************** prototile_subsamples %s' % prototile_subsamples)
+        log('****************** levelSubsample %s' % levelSubsample)
+        actual_subsample = prototile_subsamples[z] if z < len(prototile_subsamples) else 1
+        desired_subsample = levelSubsample[z] if z < len(levelSubsample) else 1
+        prototile_subsample = desired_subsample / actual_subsample
+        log('****************** z %d, desired_subsample %g, prototile_subsample %g' % (z, desired_subsample, prototile_subsample))
 
-    if z < 5:
-        # Further subsample the points
-        subsample = 2.0 ** ((5.0 - z) / 2.0)  # z=4, subsample=2;  z=3, subsample=4 ...
-        # We're further subsampling the prototile
-        prototile_subsample /= subsample
-        incount = int(incount / subsample)
+    else:
+        # subsampling factors already baked into prototiles, from C02 Generate prototiles.ipynb
+        prototile_subsamples = [
+            0.001, # level 0
+            0.001,
+            0.001,
+            0.001,
+            0.001,
+            0.001,
+            0.004,
+            0.016,
+            0.064,
+            0.256,
+            1.0    # level 10
+        ]
+        prototile_subsample = 1
+        if z < len(prototile_subsamples):
+            prototile_subsample = prototile_subsamples[z]
+
+        if z < 5:
+            # Further subsample the points
+            subsample = 2.0 ** ((5.0 - z) / 2.0)  # z=4, subsample=2;  z=3, subsample=4 ...
+            # We're further subsampling the prototile
+            prototile_subsample /= subsample
+            incount = int(incount / subsample)
     
-
     local_tile_width = 256.0 / 2 ** int(z)
     min_x = int(x) * local_tile_width
     max_x = min_x + local_tile_width
     min_y = int(y) * local_tile_width
     max_y = min_y + local_tile_width
-
 
     # z=10, r=0.5, area=1
     # z=11, r=sqrt(2)/2, area=2
@@ -772,7 +796,7 @@ def generate_tile_data_pixmap(layer, z, x, y, tile_width_in_pixels, format):
         radius = 2 ** ((z-12)/2.0)  # radius 1 for z=11.  radius 2 for z=12.  radius 4 for z=13
 
     if format == 'box':
-        tile_data = numpy.zeros((len(layer['colors_rgba8']), tile_width_in_pixels, tile_width_in_pixels), dtype=numpy.uint8)
+        tile_data = np.zeros((len(layer['colors_rgba8']), tile_width_in_pixels, tile_width_in_pixels), dtype=np.uint8)
         if incount > 0:
             status = compute_tile_data_box(prototile_path, incount, tile_data, tile_width_in_pixels,
                                            layer['populations'],
@@ -782,7 +806,7 @@ def generate_tile_data_pixmap(layer, z, x, y, tile_width_in_pixels, format):
             status = 0
     else:
         bytes_per_pixel = 4 # RGBA x 8-bit
-        tile_data = numpy.zeros((tile_width_in_pixels, tile_width_in_pixels, bytes_per_pixel), dtype=numpy.uint8)
+        tile_data = np.zeros((tile_width_in_pixels, tile_width_in_pixels, bytes_per_pixel), dtype=np.uint8)
         if incount > 0:
             status = compute_tile_data_png(prototile_path, incount, tile_data, tile_width_in_pixels,
                                            layer['populations'], layer['colors_rgba8'],
@@ -794,23 +818,24 @@ def generate_tile_data_pixmap(layer, z, x, y, tile_width_in_pixels, format):
         raise Exception('compute_tile_data returned error %d.  path %s %d' % (status, prototile_path, incount))
 
     duration = int(1000 * (time.time() - start_time))
-    log('{z}/{x}/{y}: {duration}ms to create pixmap tile from prototile'.format(**locals()))
+    log(f'{z}/{x}/{y}: {duration}ms to create pixmap tile from prototile')
 
     return tile_data
 
 
 def gzip_buffer(buf, compresslevel=1):
-    str = StringIO.StringIO()
+    str = io.BytesIO()
     out = gzip.GzipFile(fileobj=str, mode='wb', compresslevel=compresslevel)
     out.write(buf)
     out.flush()
     return str.getvalue()
 
-def generate_tile_data_png_or_box(layer, z, x, y, tile_width_in_pixels, format):
-    tile_data = generate_tile_data_pixmap(layer, z, x, y, tile_width_in_pixels, format)
+def generate_tile_data_png_or_box(layer, z, x, y, tile_width_in_pixels, format, draw_options={}):
+    tile_data = generate_tile_data_pixmap(layer, z, x, y, tile_width_in_pixels, format, draw_options)
     if format == 'png':
-        out = StringIO.StringIO()
-        scipy.misc.imsave(out, tile_data, format='png')
+        out = io.BytesIO()
+        #scipy.misc.imsave(out, tile_data, format='png')
+        imageio.imwrite(out, tile_data, format='png')
         png = out.getvalue()
         return png
     else:
@@ -854,6 +879,7 @@ def generate_tile_data_mp4(layers, z, x, y, tile_width_in_pixels):
     p.stdin.flush()
     p.stdin.close()
     ret = p.wait()
+    ret
     encoding_time = time.time() - before_time
     video_contents = open(video_path).read()
     os.unlink(video_path)
@@ -865,19 +891,15 @@ def generate_tile_data(layer, z, x, y, use_c=False):
     start_time = time.time()
     # remove block # and seq #, add color
     
-    prototile_path = 'prototiles/{z}/{x}/{y}.bin'.format(**locals())
-    incount = os.path.getsize(prototile_path) / prototile_record_len
+    prototile_path = f'prototiles/{z}/{x}/{y}.bin'
+    incount = int(os.path.getsize(prototile_path) / prototile_record_len)
     
     # Preallocate output array for returned tile
     tile = bytearray(tile_record_len * incount)
 
     if incount > 0:
-        if use_c:
-            ctd = compute_tile_data_c
-        else:
-            ctd = compute_tile_data_python
-        
-        outcount = ctd(prototile_path, incount, tile, layer['populations'], layer['colors'])
+        assert use_c
+        outcount = compute_tile_data_c(prototile_path, incount, tile, layer['populations'], layer['colors'])
     else:
         outcount = 0
 
@@ -885,7 +907,7 @@ def generate_tile_data(layer, z, x, y, use_c=False):
         raise Exception('compute_tile_data returned error %d' % outcount)
 
     duration = int(1000 * (time.time() - start_time))
-    log('{z}/{x}/{y}: {duration}ms to create tile from prototile'.format(**locals()))
+    log(f'{z}/{x}/{y}: {duration}ms to create tile from prototile')
 
     return tile[0 : outcount * tile_record_len]
 
@@ -893,14 +915,14 @@ layer_cache = LruDict(50) # max entries
 
 def find_or_generate_layer(layerdef):
     if layer_cache.has(layerdef):
-        print 'Using cached {layerdef}'.format(**locals())
+        print(f'Using cached {layerdef}')
         return layer_cache.get(layerdef)
 
     start_time = time.time()
     start_cputime_ms = cputime_ms()
     
-    layerdef_hash = md5.new(layerdef).hexdigest()
-    log('{layerdef_hash}: computing from {layerdef}'.format(**locals()))
+    layerdef_hash = hashlib.md5(layerdef.encode('utf-8')).hexdigest()
+    log(f'{layerdef_hash}: computing from {layerdef}')
     colors = []
     populations = []
     for (color, expression) in [x.split(';') for x in layerdef.split(';;')]:
@@ -908,13 +930,15 @@ def find_or_generate_layer(layerdef):
         populations.append(eval_layer_column(expression))
 
     layer = {'populations': populations,
-             'colors': parse_colors(colors, encoding=numpy.float32),
-             'colors_rgba8': parse_colors(colors, encoding=numpy.uint32)}
+             'colors': parse_colors(colors, encoding=np.float32),
+             'colors_rgba8': parse_colors(colors, encoding=np.uint32)}
     layer_cache.insert(layerdef, layer)
     duration = int(1000 * (time.time() - start_time))
     cpu = cputime_ms() - start_cputime_ms
-    log('{layerdef_hash}: {duration}ms ({cpu}ms CPU) to create'.format(**locals()))
+    log(f'{layerdef_hash}: {duration}ms ({cpu}ms CPU) to create')
     return layer
+
+
 
 @app.route('/tilesv1/<layersdef>/512x512/<z>/<x>/<y>.mp4')
 def serve_video_tile_v1_mp4(layersdef, z, x, y):
@@ -929,7 +953,7 @@ def serve_video_tile_v1_mp4(layersdef, z, x, y):
         #response = flask.Response(tile, mimetype='video/mp4')
         response = flask.Response(tile, mimetype='video/webm')
     except:
-        print traceback.format_exc()
+        print(traceback.format_exc())
         raise
     response.headers['Access-Control-Allow-Origin'] = '*'
     return response
@@ -940,51 +964,73 @@ def serve_tile_v1_png(layerdef, z, x, y):
         layer = find_or_generate_layer(layerdef)
         tile_width_in_pixels = 512
         tile = generate_tile_data_png_or_box(layer, z, x, y, tile_width_in_pixels, 'png')
-        outcount = len(tile) / tile_record_len
+        #outcount = len(tile) / tile_record_len
         
         response = flask.Response(tile, mimetype='image/png')
     except:
-        print traceback.format_exc()
+        print(traceback.format_exc())
         raise
     response.headers['Access-Control-Allow-Origin'] = '*'
     return response
 
-def generate_tile_data_tbox(layers, z, x, y, tile_width_in_pixels):
-    frames = [generate_tile_data_png_or_box(layer, z, x, y, tile_width_in_pixels, 'box') for layer in layers]
+def generate_tile_data_tbox(layers, z, x, y, tile_width_in_pixels, draw_options={}):
+    frames = [generate_tile_data_png_or_box(layer, z, x, y, tile_width_in_pixels, 'box', draw_options) for layer in layers]
     return b''.join(frames)
 
-def get_layerdef(layername):
-    dotmap_dict = SqliteDict(dotmap_layerdef_path, flag='c',
-                             tablename=dotmap_layerdef_table_name,
-                             autocommit=False)
-    if not layername in dotmap_dict:
-        abort400('Cannot find layer named "%s" in local database (consider running reload-layers.)' % layername)
-    return dotmap_dict[layername]
+# HTML description of .box tile
+def describe_tile_box(tile, tile_width_in_pixels):
+    n_pixels = tile_width_in_pixels ** 2
+    assert len(tile) % n_pixels == 0
+    num_colors = len(tile) // n_pixels
+    ret = f'<pre>Number of colors: {num_colors}\n'
+    for i in range(num_colors):
+        color_array = np.frombuffer(tile, dtype=np.uint8, count=n_pixels, offset=i * n_pixels)
+        nonzero = np.count_nonzero(color_array)
+        ret += f'   Color {i}: {nonzero} nonzero values'
+        if nonzero:
+            ret += f', with average {color_array.sum() / nonzero:.5f}'
+        ret += '\n'
+    ret += '</pre>\n'
+    return ret
 
-# .box V1 (single frame)
-@app.route('/tilesv1/<layerdef>/<z>/<x>/<y>.box')
-@gzipped
-def serve_tile_v1_box(layerdef, z, x, y):
+# Serves v1 and v2 "box" (single-frame) tiles 
+def serve_tile_box(layerdef, z, x, y, draw_options=None):
+    log(f'serve tile box draw options= {draw_options}')
     try:
         layer = find_or_generate_layer(layerdef)
         tile_width_in_pixels = 256
-        tile = generate_tile_data_png_or_box(layer, z, x, y, tile_width_in_pixels, 'box')
-        
-        response = flask.Response(tile, mimetype='application/octet-stream')
+        tile = generate_tile_data_png_or_box(layer, z, x, y, tile_width_in_pixels, 'box', draw_options)
+        if 'debug' in request.args:
+            # decode the tile instead
+            response = flask.Response(describe_tile_box(tile, tile_width_in_pixels))
+        else:
+            response = flask.Response(tile, mimetype='application/octet-stream')
+            
     except:
-        print traceback.format_exc()
+        print(traceback.format_exc())
         raise
     response.headers['Access-Control-Allow-Origin'] = '*'
     return response
 
-# .box V2 (single frame)
+
+# .box V1 (single frame), using full definition in URL
+# This is deprecated in favor of .box v2, because complex definitions won't fit in the URL
+@app.route('/tilesv1/<layerdef>/<z>/<x>/<y>.box')
+@gzipped
+def serve_tile_v1_box(layerdef, z, x, y):
+    log(f'DEPRECATED URL {request.url};  switch to /tilesv2/layername instead')
+    return serve_tile_box(layerdef, z, x, y)
+
+# .box V2 (single frame), using layer name
+# Looks up layer defintion -- column expressions and colors -- from database, which itself is loaded
+#  from google sheet
 @app.route('/tilesv2/<layername>/<z>/<x>/<y>.box')
 @gzipped
 def serve_tile_v2_box(layername, z, x, y):
-    dotmap_dict = SqliteDict(dotmap_layerdef_path, flag='c',
-                             tablename=dotmap_layerdef_table_name,
-                             autocommit=False)
-    return serve_tile_v1_box(get_layerdef(layername), z, x, y)
+    #dotmap_dict = SqliteDict(dotmap_layerdef_path, flag='c',
+    #                         tablename=dotmap_layerdef_table_name,
+    #                         autocommit=False)
+    return serve_tile_box(get_layerdef(layername), z, x, y, get_draw_options(layername))
 
 # .tbox V1 (animated)
 @app.route('/tilesv1/<layerdefs>/<z>/<x>/<y>.tbox')
@@ -1000,21 +1046,47 @@ def serve_tile_v1_tbox(layerdefs, z, x, y):
         
         response = flask.Response(tile, mimetype='application/octet-stream')
     except:
-        print traceback.format_exc()
+        print(traceback.format_exc())
         raise
     response.headers['Access-Control-Allow-Origin'] = '*'
     return response
+
+
+def get_layer_from_db(layername):
+    log(layername)
+    dicts = engine.execute_returning_dicts(f'SELECT * FROM {dotmaptiles_table} WHERE layer_id = %(layer_id)s;', {'layer_id': layername})
+    if not dicts:
+        abort400('Cannot find layer named "%s" in local database (consider running reload-layers.)' % layername)
+    return dicts[0]
+
+def get_layerdef(layername):
+    return get_layer_from_db(layername)['layerdef']
+
+def get_draw_options(layername):
+    return get_layer_from_db(layername)['drawopts']
 
 # .tbox V2 (animated)
 @app.route('/tilesv2/<layername>/<z>/<x>/<y>.tbox')
 @gzipped
 def serve_tile_v2_tbox(layername, z, x, y):
     frame_layernames = get_layerdef(layername).split('|')
-    print('serving tbox: layer %s expands to frames %s' % (layername, frame_layernames))
+    log('serving tbox: layer %s expands to frames %s' % (layername, frame_layernames))
 
     layers = [find_or_generate_layer(get_layerdef(frame_layername)) for frame_layername in frame_layernames]
+
+    draw_options = get_draw_options(layername)
     
-    return serve_tile_v1_tbox(layers, z, x, y)
+    try:
+        tile_width_in_pixels = 256
+        tile = generate_tile_data_tbox(layers, z, x, y, tile_width_in_pixels, draw_options)
+        
+        response = flask.Response(tile, mimetype='application/octet-stream')
+    except:
+        print(traceback.format_exc())
+        raise
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    return response
+    #return serve_tile_v1_tbox(layers, z, x, y)
 
 # .bin is the first tile format, with every point enumerated, vector-style
 @app.route('/tilesv1/<layerdef>/<z>/<x>/<y>.<suffix>')
@@ -1028,9 +1100,9 @@ def serve_tile_v1(layerdef, z, x, y, suffix):
         
         if suffix == 'debug':
             html = '<html><head></head><body>'
-            html += 'tile {layer}/{z}/{y}/{x}  has {outcount} points<br>'.format(**locals())
+            html += f'tile {layer}/{z}/{y}/{x}  has {outcount} points<br>'
             for i in range(0, min(outcount, 10)):
-                html += 'Point {i}: '.format(**locals())
+                html += f'Point {i}: '
                 html += ', '.join([str(x) for x in struct.unpack_from(tile_record_format, tile, i * tile_record_len)])
                 html += '<br>\n'
             if outcount > 10:
@@ -1041,9 +1113,9 @@ def serve_tile_v1(layerdef, z, x, y, suffix):
         elif suffix == 'bin':
             response = flask.Response(tile[0 : outcount * tile_record_len], mimetype='application/octet-stream')
         else:
-            abort400('Invalid suffix {suffix}'.format(**locals()))
+            abort400(f'Invalid suffix {suffix}')
     except:
-        print traceback.format_exc()
+        print(traceback.format_exc())
         if suffix == 'debug':
             html = '<html><head></head><body><pre>\n'
             html += traceback.format_exc()
@@ -1058,12 +1130,12 @@ def serve_tile_v1(layerdef, z, x, y, suffix):
 def show_datasets():
     html = '<html><head></head><body><h1>Available datasets:</h1>\n'
     for ds in list_datasets():
-        html += '<a href="data/{ds}">{ds}</a><br>\n'.format(**locals())
+        html += f'<a href="data/{ds}">{ds}</a><br>\n'
     html += '</body></html>'
     return html
 
 def compute_json_path(dataset):
-    return '{cache_dir}/{dataset}/description.json'.format(cache_dir=cache_dir, **locals())
+    return f'{cache_dir}/{dataset}/description.json'
 
 @app.route('/data/<dataset>.json')
 def dataset_json(dataset):
@@ -1081,13 +1153,13 @@ def show_dataset_columns(dataset):
         if dataset == 'census2000_block2010':
             columns = [c for c in columns if c == c.upper()]
         html.append('<a href="../data">Back to all datasets</a><br>')
-        html.append('<h1>Columns in dataset {dataset}:</h1>'.format(**locals()))
+        html.append(f'<h1>Columns in dataset {dataset}:</h1>')
         for col in columns:
-            html.append('{col}<br>'.format(**locals()))
+            html.append(f'{col}<br>')
         html.append('</body></html>')
         return '\n'.join(html)
     except:
-        print traceback.format_exc()
+        print(traceback.format_exc())
         raise
 
 @app.route('/data/<dataset>/<column>.float32')
@@ -1118,15 +1190,32 @@ def get_asset(filename):
 if __name__ == '__main__':
     with app.test_request_context(sys.argv[1]):
         response = app.full_dispatch_request()
-        print response.status_code
-        print response.get_data()
+        print(response.status_code)
+        print(response.get_data())
         
 @app.route('/reload-layers')
 def reload_layers():
-    # Create a persistent table for dotmap layerdefs
-    dotmap_dict = SqliteDict(dotmap_layerdef_path, flag='c',
-                             tablename=dotmap_layerdef_table_name,
-                             autocommit=False)
+
+    # # Will mutate records by setting mirroredTime, baseKey, tablename, view
+    # def upsert(self, con, records, mirroredTime):
+    #     if not records:
+    #         return
+    #     for record in records:
+    #         record.update(self.db_indices()) # set baseKey, tablename, view
+    #         record['mirroredTime'] = mirroredTime
+
+    #     before = con.scalar(mirror_table.count())
+    #     ins = psql_insert(mirror_table)
+    #     upsert = ins.on_conflict_do_update(
+    #         constraint=mirror_table.primary_key,
+    #         set_=dict(
+    #             mirroredTime=ins.excluded.mirroredTime,
+    #             createdTime=ins.excluded.createdTime,
+    #             fields=ins.excluded.fields))
+    #     con.execute(upsert, records)
+    #     after = con.scalar(mirror_table.count())
+    #     n_inserted = after - before
+    #     print(f'Upserted {len(records)} records ({len(records)-n_inserted} updated, {n_inserted} inserted): {self.compositeName()}')
 
     # This points to the default version of the layer sheet.  Be aware that anyone
     # using non-standard dotmap sheet, or anyone modifying the default sheet without
@@ -1145,36 +1234,65 @@ def reload_layers():
             not def_colnames[i] in dotmap_df.columns):
             col_count = i
             break
-        
+    
+    records = []
+    errors = []
+
     # For each row in dotmap_df, extract all the non-empty colors into a string
     for idx in dotmap_df.index:
         layer_id = dotmap_df.at[idx,'Share link identifier']
+        draw_opts_str = dotmap_df.at[idx, 'Draw Options']
         anim_str = dotmap_df.at[idx,'AnimationLayers']
+
+        record = {'layer_id': layer_id, 'drawopts': '{}'}
+
+        if not pd.isna(draw_opts_str) and not draw_opts_str=='':
+            try:
+                record['drawopts'] = json.dumps(json.loads(draw_opts_str))
+            except:
+                errors.append(['Error parsing Draw Options JSON for {layer_id}'])
 
         if not pd.isna(anim_str) and not anim_str=='':
             # This is an animation layer, store anim_str
             # in dotmap_dict
-            dotmap_dict[layer_id] = anim_str
-            continue
+            record['layerdef'] = anim_str
+        else:
+            # Not an animiation layer, put together the color and definition fields
+            ldef_arr = []
+            for i in range(0, col_count):
+                color_str = dotmap_df.at[idx,color_colnames[i]]
+                def_str =   dotmap_df.at[idx,def_colnames[i]]
+                if pd.isna(color_str) or pd.isna(def_str) or color_str == '' or def_str == '':
+                    # We're done here
+                    break
 
-        # Not an animiation layer, put together the color and definition fields
-        ldef_arr = []
-        for i in range(0, col_count):
-            color_str = dotmap_df.at[idx,color_colnames[i]]
-            def_str =   dotmap_df.at[idx,def_colnames[i]]
-            if pd.isna(color_str) or pd.isna(def_str) or color_str == '' or def_str == '':
-                # We're done here
-                break
+                # Extend ldef_arr
+                ldef_arr.append('%s;%s'%(color_str,def_str))
 
-            # Extend ldef_arr
-            ldef_arr.append('%s;%s'%(color_str,def_str))
+            # Join the ldef elements from each set of color/definitions
+            # for this layer into a single string
+            record['layerdef'] = ';;'.join(ldef_arr)
 
-        # Join the ldef elements from each set of color/definitions
-        # for this layer into a single string
-        ldef_str = ';;'.join(ldef_arr)
-        dotmap_dict[layer_id] = ldef_str
-        
-    # Save results persistently into dotmap_dict
-    dotmap_dict.commit()
+        records.append(record)
 
-    return flask.Response('%d layers loaded successfully!' % (len(dotmap_df)))
+    with engine.connect() as con:
+        for record in records:
+            con.execute(f"""
+                INSERT INTO {dotmaptiles_table} (layer_id, layerdef, drawopts)
+                    VALUES (%(layer_id)s, %(layerdef)s, %(drawopts)s)
+                ON CONFLICT (layer_id) DO
+                    UPDATE SET layerdef=excluded.layerdef, drawopts=excluded.drawopts;""", 
+                record)
+
+
+    count = engine.execute_count(f'SELECT COUNT(*) FROM {dotmaptiles_table};')
+
+    response = f'''
+<pre>
+{len(records)} layers loaded with {len(errors)} errors
+{chr(10).join(errors)}
+There are now {count} records in table
+</pre>'''
+
+    return(response)
+

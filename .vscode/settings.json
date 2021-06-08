@@ -1,0 +1,16 @@
+{
+    "files.watcherExclude": {
+        "**/columncache/**": true,
+        "**/prototiles*/**": true
+    },
+    "python.pythonPath": "/home/rsargent/superconda-1/bin/python",
+    "python.linting.pylintEnabled": true,
+    "python.linting.enabled": true,
+    "files.exclude": {
+        "**/columncache": true,
+        "**/expression_cache": true,
+        "**/prototiles": true,
+        "**/prototiles002": true,
+        "**/prototiles003": true
+    }
+}
