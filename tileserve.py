@@ -117,7 +117,7 @@ def gzipped(f):
     
     return view_func
 
-# msg will be html-escaped, or use html= to send raw html
+# msg will be html-escaped, or use html_msg= to send raw html
 def abort400(msg=None, html_msg=None):
     if msg and html_msg:
         raise Exception('abort400 should specify eithier msg or html_msg, not both')
@@ -162,7 +162,7 @@ def parse_color(color, encoding=np.float32):
                                encoding)
     except:
         pass
-    abort400(html='Cannot parse color <code><b>%s</b></code> from spreadsheet.<br><br>Color must be in standard web form, <code><b>#RRGGBB</b></code>, where RR, GG, and BB are each two-digit hexadecimal numbers between 00 and FF.<br><br>See <a href="https://www.w3schools.com/colors/colors_picker.asp">HTML Color Picker</a>' % color)
+    abort400(html_msg='Cannot parse color <code><b>%s</b></code> from spreadsheet.<br><br>Color must be in standard web form, <code><b>#RRGGBB</b></code>, where RR, GG, and BB are each two-digit hexadecimal numbers between 00 and FF.<br><br>See <a href="https://www.w3schools.com/colors/colors_picker.asp">HTML Color Picker</a>' % color)
 
 def parse_colors(colors, encoding=np.float32):
     packed = [parse_color(color, encoding) for color in colors]
@@ -226,7 +226,7 @@ def dataroot():
 def list_columns(dataset):
     dir = f'{cache_dir}/{dataset}'
     if not os.path.exists(dir):
-        abort400(html = f'Dataset named "{html.escape(dataset)}" not found.<br><br><a href="{html.escape(dataroot())}">List valid datasets</a>')
+        abort400(html_msg = f'Dataset named "{html.escape(dataset)}" not found.<br><br><a href="{html.escape(dataroot())}">List valid datasets</a>')
     return sorted([os.path.basename(os.path.splitext(c)[0]) for c in (glob.glob(dir + '/*.float32') + glob.glob(dir + '/*.numpy'))])
 
 # Removing the least recent takes O(N) time;  could be make more efficient if needed for larger dicts
@@ -271,12 +271,12 @@ def load_column(dataset, column):
         return column_cache.get(cache_key)
     dir = f'{cache_dir}/{dataset}'
     if not os.path.exists(dir):
-        abort400(html=f'Dataset named "{html.escape(dataset)}" not found.<br><br><a href="{html.escape(dataroot())}">List valid datasets</a>')
+        abort400(html_msg=f'Dataset named "{html.escape(dataset)}" not found.<br><br><a href="{html.escape(dataroot())}">List valid datasets</a>')
     cache_filename_prefix = dir + '/' + column
     cache_filename = cache_filename_prefix + '.float32'
     if not os.path.exists(cache_filename):
         if not os.path.exists(cache_filename_prefix + '.numpy'):
-            abort400(html=f'''Column named "{html.escape(column)}" in dataset "{html.escape(dataset)}" not found.<br><br>
+            abort400(html_msg=f'''Column named "{html.escape(column)}" in dataset "{html.escape(dataset)}" not found.<br><br>
                               <a href="{html.escape(dataroot())}/{html.escape(dataset)}">List valid columns from {html.escape(dataset)}</a>''')
         data = np.load(open(cache_filename_prefix + '.numpy')).astype(np.float32)
         tmpfile = cache_filename + '.tmp.%d.%d' % (os.getpid(), threading.current_thread().ident)
@@ -334,7 +334,7 @@ def eval_layer_column(expr):
             expr = expr.replace(' DIV ', '/')
             data = eval_(ast.parse(expr, mode='eval').body).astype(np.float32)
         except SyntaxError:
-            abort400(html = '<pre>' + html.escape(traceback.format_exc(0)) + '</pre>')
+            abort400(html_msg = '<pre>' + html.escape(traceback.format_exc(0)) + '</pre>')
         
         try:
             os.mkdir('expression_cache')
