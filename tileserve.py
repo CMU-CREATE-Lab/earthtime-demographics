@@ -278,7 +278,7 @@ def load_column(dataset, column):
         if not os.path.exists(cache_filename_prefix + '.numpy'):
             abort400(html_msg=f'''Column named "{html.escape(column)}" in dataset "{html.escape(dataset)}" not found.<br><br>
                               <a href="{html.escape(dataroot())}/{html.escape(dataset)}">List valid columns from {html.escape(dataset)}</a>''')
-        data = np.load(open(cache_filename_prefix + '.numpy')).astype(np.float32)
+        data = np.load(open(cache_filename_prefix + '.numpy', 'rb')).astype(np.float32)
         tmpfile = cache_filename + '.tmp.%d.%d' % (os.getpid(), threading.current_thread().ident)
         data.tofile(tmpfile)
         os.rename(tmpfile, cache_filename)
