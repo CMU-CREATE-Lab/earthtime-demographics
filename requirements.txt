@@ -10,3 +10,4 @@ mapclassify
 flask
 sqlitedict
 imageio
+gunicorn

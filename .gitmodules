@@ -4,3 +4,6 @@
 [submodule "utils"]
 	path = utils
 	url = https://github.com/CMU-CREATE-Lab/python-utils.git
+[submodule "psql_utils"]
+	path = psql_utils
+	url = https://github.com/CMU-CREATE-Lab/psql_utils.git

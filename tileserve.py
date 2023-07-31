@@ -9,7 +9,7 @@ from tileserver_utils import compile_and_load, to_ctype_reference, read_csv_url
 import numpy as np
 import pandas as pd
 from scipy.sparse import load_npz
-from utils import epsql
+from psql_utils import epsql
 from typing import Literal, Tuple, Union
 
 engine = epsql.Engine()
@@ -436,7 +436,7 @@ def eval_(node, geography_year):
         if not func_name in functions:
             abort400(f'Function {func_name} does not exist.  Valid functions are ' +
                      ', '.join(sorted(functions.keys())))
-        return functions[func_name](*[eval_(arg) for arg in node.args])
+        return functions[func_name](*[eval_(arg, geography_year) for arg in node.args])
     elif isinstance(node, ast.Attribute):
         return load_column(node.value.id, node.attr, geography_year)
     abort400('cannot parse %s' % ast.dump(node))
