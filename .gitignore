@@ -11,3 +11,10 @@ dotmap_layerdefs.db
 junkyard
 prototiles003
 dotmap_layerdefs.db-journal
+prototiles.2020
+.venv
+census_db_2020_geoids.json
+nhgis_blk2010_blk2020_gj_README.txt
+nhgis_blk2010_blk2020_gj.csv
+tmp
+crosswalk_matrix_2010_2020_old.npz

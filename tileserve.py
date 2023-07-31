@@ -8,9 +8,11 @@ from sqlitedict import SqliteDict
 from tileserver_utils import compile_and_load, to_ctype_reference, read_csv_url
 import numpy as np
 import pandas as pd
+from scipy.sparse import load_npz
 from utils import epsql
-engine = epsql.Engine()
+from typing import Literal, Tuple, Union
 
+engine = epsql.Engine()
 
 def cputime_ms():
     resources = resource.getrusage(resource.RUSAGE_SELF)
@@ -49,14 +51,14 @@ else:
     dotmaptiles_table = "dotmaptiles_staging"
 log(f'Containing dir {containing_dir}, is_production={is_production}, dotmaptiles_table={dotmaptiles_table}')
 
-if not engine.table_exists(dotmaptiles_table):
-    log(f'{dotmaptiles_table} does not exist, creating...')
-    engine.execute(f"""
-        CREATE TABLE {dotmaptiles_table} (
-            layer_id text primary key,
-            layerdef text,
-            drawopts jsonb
-        );""", verbose=True)
+engine.execute(f"""
+    CREATE TABLE IF NOT EXISTS {dotmaptiles_table} (
+        layer_id text primary key,
+        layerdef text,
+        drawopts jsonb,
+        geography_year int
+    );""")
+engine.execute(f"ALTER TABLE {dotmaptiles_table} ADD COLUMN IF NOT EXISTS geography_year int")
 
 app = flask.Flask(__name__)
 
@@ -69,7 +71,7 @@ def handle_before_request_log():
         global requestno
         requestno += 1
         g.requestno = requestno
-    log(f'START REQUEST {request.url}')
+    log(f'START REQUEST {request.url}') 
 
 @app.teardown_request
 def handle_teardown_request_log(exception):
@@ -166,7 +168,7 @@ def parse_color(color, encoding=np.float32):
 
 def parse_colors(colors, encoding=np.float32):
     packed = [parse_color(color, encoding) for color in colors]
-    return np.array(packed, dtype = encoding)
+    return np.array(packed, dtype = encoding) 
 
 color3dark1 = parse_colors(['#1b9e77','#d95f02','#7570b3'])
 color3dark2 = parse_colors(['#66c2a5','#fc8d62','#8da0cb'])
@@ -265,27 +267,146 @@ def map_as_array(path):
     return np.memmap(path, dtype=np.float32, mode='r')
 
 
-def load_column(dataset, column):
-    cache_key = f'{dataset}.{column}'
-    if column_cache.has(cache_key):
-        return column_cache.get(cache_key)
-    dir = f'{cache_dir}/{dataset}'
-    if not os.path.exists(dir):
-        abort400(html_msg=f'Dataset named "{html.escape(dataset)}" not found.<br><br><a href="{html.escape(dataroot())}">List valid datasets</a>')
-    cache_filename_prefix = dir + '/' + column
-    cache_filename = cache_filename_prefix + '.float32'
-    if not os.path.exists(cache_filename):
-        if not os.path.exists(cache_filename_prefix + '.numpy'):
-            abort400(html_msg=f'''Column named "{html.escape(column)}" in dataset "{html.escape(dataset)}" not found.<br><br>
-                              <a href="{html.escape(dataroot())}/{html.escape(dataset)}">List valid columns from {html.escape(dataset)}</a>''')
-        data = np.load(open(cache_filename_prefix + '.numpy', 'rb')).astype(np.float32)
-        tmpfile = cache_filename + '.tmp.%d.%d' % (os.getpid(), threading.current_thread().ident)
-        data.tofile(tmpfile)
-        os.rename(tmpfile, cache_filename)
+# def load_column_old(dataset, column):
+#     cache_key = f'{dataset}.{column}'
+#     if column_cache.has(cache_key):
+#         return column_cache.get(cache_key)
+#     dir = f'{cache_dir}/{dataset}'
+#     if not os.path.exists(dir):
+#         abort400(html_msg=f'Dataset named "{html.escape(dataset)}" not found.<br><br><a href="{html.escape(dataroot())}">List valid datasets</a>')
+#     cache_filename_prefix = dir + '/' + column
+#     cache_filename = cache_filename_prefix + '.float32'
+#     if not os.path.exists(cache_filename):
+#         if not os.path.exists(cache_filename_prefix + '.numpy'):
+#             abort400(html_msg=f'''Column named "{html.escape(column)}" in dataset "{html.escape(dataset)}" not found.<br><br>
+#                               <a href="{html.escape(dataroot())}/{html.escape(dataset)}">List valid columns from {html.escape(dataset)}</a>''')
+#         data = np.load(open(cache_filename_prefix + '.numpy', 'rb')).astype(np.float32)
+#         tmpfile = cache_filename + '.tmp.%d.%d' % (os.getpid(), threading.current_thread().ident)
+#         data.tofile(tmpfile)
+#         os.rename(tmpfile, cache_filename)
 
-    data = map_as_array(cache_filename)
+#     data = map_as_array(cache_filename)
+#     column_cache.insert(cache_key, data)
+#     return data
+
+# Loading columns
+
+GeographyYear = Literal[2010, 2020]
+
+def load_column(dataset: str, column: str, year: GeographyYear) -> Union[np.memmap, str]:
+    """Gets the block data of a dataset interpreted for the given year
+
+    Parameters:
+        dataset: the name of the dataset
+        column: the name of the column
+        year: the geography year
+
+    Returns:
+        Memory mapped vector of the column
+
+    Raises:
+        Exception if the dataset or column does not exist
+    """
+
+    load_method = try_load_block_data_2010 if year == 2010 else try_load_block_data_2020
+    (success, data) = load_method(dataset, column)
+
+    if not success:
+        raise Exception(data)
+
+    return data   
+
+def try_load_block_data_2010(dataset: str, column: str) -> Tuple[bool, Union[np.memmap, str]]:
+    """Tries to map the 2010 block data of a dataset
+
+    Parameters:
+        dataset: the name of the dataset
+        column: the name of the column
+    
+    Returns:
+        A pair where the first element indicates success, and the second is 
+        a string with the reason for failure, or the memory mapped vector.
+    """
+    (cached, cache_key, filename_prefix, filename) = _try_load_from_cache(dataset, column, 2010)
+
+    if isinstance(cached, str):
+        return False, cached
+    
+    if cached is not None:
+        return True, cached
+
+    if not os.path.exists(filename):
+        if not os.path.exists(f"{filename_prefix}.numpy"):
+            return False, f"No column named {column} in dataset {dataset}."
+
+        data = np.load(f"{filename_prefix}.numpy").astype(np.float32)
+        tmp_filename = f"{filename}.tmp.{os.getpid()}.{threading.current_thread().ident}"
+
+        data.tofile(tmp_filename)
+
+        os.rename(tmp_filename, filename)
+
+    data = map_as_array(filename)
     column_cache.insert(cache_key, data)
-    return data
+
+    return True, data
+
+def try_load_block_data_2020(dataset: str, column: str) -> Tuple[bool, Union[np.memmap, str]]:
+    """Tries to map the 2020 block data of a dataset
+
+    Parameters:
+        dataset: the name of the dataset
+        column: the name of the column
+    
+    Returns:
+        A pair where the first element indicates success, and the second is 
+        a string with the reason for failure, or the memory mapped vector.
+    """
+    (cached, cache_key, _, filename) = _try_load_from_cache(dataset, column, 2020)
+
+    if isinstance(cached, str):
+        return False, cached
+    
+    if cached is not None:
+        return True, cached
+
+    if not os.path.exists(filename):
+        (success, data_2010) = try_load_block_data_2010(dataset, column)
+
+        if not success:
+            return success, data_2010
+
+        print(f"Interpolating 2010 column {dataset}.{column} to 2020")
+
+        crosswalk_matrix = load_npz("./crosswalk_matrix_2010_2020.npz")
+        data_2020 = crosswalk_matrix.dot(data_2010)
+        tmp_filename = f"{filename}.2020.tmp.{os.getpid()}.{threading.current_thread().ident}"
+
+        data_2020.tofile(tmp_filename)
+
+        os.rename(tmp_filename, filename)
+
+    data = map_as_array(filename)
+    column_cache.insert(cache_key, data)
+    return True, data
+
+def _try_load_from_cache(dataset: str, column: str, year: GeographyYear) -> Tuple[Union[None, np.memmap, str], str, str, str]:
+    cache_key = f'{dataset}.{column}{"" if year == 2010 else f".{year}"}'
+    
+    if column_cache.has(cache_key):
+        return column_cache.get(cache_key), "", "", ""
+    
+    cache_dir = "columncache"
+    dataset_dir = f"{cache_dir}/{dataset}"
+
+    if not os.path.exists(dataset_dir):
+        return f"No such dataset: {dataset}", "", "", ""
+
+    filename_prefix = f"{dataset_dir}/{column}"
+    filename = f"{filename_prefix}{'.2020' if year == 2020 else ''}.float32"
+
+    return [None, cache_key, filename_prefix, filename]
+
 
 binary_operators = {
     ast.Add:  np.add,
@@ -303,13 +424,13 @@ functions = {
     'min': np.minimum,
 }
 
-def eval_(node):
+def eval_(node, geography_year):
     if isinstance(node, ast.Num): # <number>
         return node.n
     elif isinstance(node, ast.BinOp): # <left> <operator> <right>
-        return binary_operators[type(node.op)](eval_(node.left), eval_(node.right))
+        return binary_operators[type(node.op)](eval_(node.left, geography_year), eval_(node.right, geography_year))
     elif isinstance(node, ast.UnaryOp): # <operator> <operand> e.g., -1
-        return unary_operators[type(node.op)](eval_(node.operand))
+        return unary_operators[type(node.op)](eval_(node.operand, geography_year))
     elif isinstance(node, ast.Call):
         func_name = node.func.id
         if not func_name in functions:
@@ -317,13 +438,13 @@ def eval_(node):
                      ', '.join(sorted(functions.keys())))
         return functions[func_name](*[eval_(arg) for arg in node.args])
     elif isinstance(node, ast.Attribute):
-        return load_column(node.value.id, node.attr)
+        return load_column(node.value.id, node.attr, geography_year)
     abort400('cannot parse %s' % ast.dump(node))
 
 expression_cache = LruDict(50) # 
 
-def eval_layer_column(expr):
-    cache_key = hashlib.sha256(expr.encode('utf-8')).hexdigest()
+def eval_layer_column(expr, year: GeographyYear):
+    cache_key = hashlib.sha256(f"{expr}{'' if year == 2010 else ';2020'}".encode('utf-8')).hexdigest()
     if expression_cache.has(cache_key):
         return expression_cache.get(cache_key)
 
@@ -332,7 +453,9 @@ def eval_layer_column(expr):
     if not os.path.exists(cache_filename):
         try:
             expr = expr.replace(' DIV ', '/')
-            data = eval_(ast.parse(expr, mode='eval').body).astype(np.float32)
+            body = ast.parse(expr, mode='eval').body
+            evalled = eval_(body, year)
+            data = evalled.astype(np.float32)
         except SyntaxError:
             abort400(html_msg = '<pre>' + html.escape(traceback.format_exc(0)) + '</pre>')
         
@@ -341,7 +464,7 @@ def eval_layer_column(expr):
         except:
             pass
         
-        tmpfile = cache_filename + '.tmp.%d.%d' % (os.getpid(), threading.current_thread().ident)
+        tmpfile = cache_filename + f'.{year}.tmp.{os.getpid()}.{threading.current_thread().ident}'
         data.tofile(tmpfile)
         os.rename(tmpfile, cache_filename)
     
@@ -709,9 +832,9 @@ def compute_tile_data_box(prototile_path, incount, tile_box_pops, tile_width_in_
         to_ctype_reference(block_areas),
         ctypes.c_float(prototile_subsample))
 
-def generate_tile_data_pixmap(layer, z, x, y, tile_width_in_pixels, format, draw_options={}):
+def generate_tile_data_pixmap(layer, z, x, y, tile_width_in_pixels, format, geography_year, draw_options={}):
     # Load block area column
-    block_areas = load_column('geometry_block2010', 'area_web_mercator_sqm')
+    block_areas = load_column('geometry_block2010', 'area_web_mercator_sqm', geography_year)
 
     z = int(z)
     x = int(x)
@@ -730,14 +853,12 @@ def generate_tile_data_pixmap(layer, z, x, y, tile_width_in_pixels, format, draw
     # remove block # and seq #, add color
 
     levelSubsample = draw_options.get('levelSubsample', None)
-    if levelSubsample:
-        log('draw_options.levelSubsample exists, using prototiles003')
-        prototile_dir = "prototiles003"
-    else:
-        log('draw_options.levelSubsample does not exist, using prototiles')
-        prototile_dir = "prototiles"
+    prototile_dir = compute_prototile_dir(geography_year, levelSubsample)
 
-    prototile_path = "%s/%d/%d/%d.bin" % (prototile_dir, pz, px, py)
+    print(f"prototiles dir= {prototile_dir}")
+    
+
+    prototile_path = compute_prototile_path(prototile_dir, pz=pz, px=px, py=py)
     incount = os.path.getsize(prototile_path) / prototile_record_len
 
     if levelSubsample:
@@ -822,6 +943,19 @@ def generate_tile_data_pixmap(layer, z, x, y, tile_width_in_pixels, format, draw
 
     return tile_data
 
+def compute_prototile_path(prototile_dir, pz, px, py):
+    prototile_path = "%s/%d/%d/%d.bin" % (prototile_dir, pz, px, py)
+    return prototile_path
+
+def compute_prototile_dir(geography_year, levelSubsample):
+    if levelSubsample:
+        log('draw_options.levelSubsample exists, using prototiles003')
+        prototile_dir = "prototiles003"
+    else:
+        log('draw_options.levelSubsample does not exist, using prototiles')
+        log(f'using prototiles for geography {geography_year}')
+        prototile_dir = f"prototiles{'' if geography_year == 2010 else '.2020'}"
+    return prototile_dir
 
 def gzip_buffer(buf, compresslevel=1):
     str = io.BytesIO()
@@ -830,8 +964,8 @@ def gzip_buffer(buf, compresslevel=1):
     out.flush()
     return str.getvalue()
 
-def generate_tile_data_png_or_box(layer, z, x, y, tile_width_in_pixels, format, draw_options={}):
-    tile_data = generate_tile_data_pixmap(layer, z, x, y, tile_width_in_pixels, format, draw_options)
+def generate_tile_data_png_or_box(layer, z, x, y, tile_width_in_pixels, format, geography_year, draw_options={}):
+    tile_data = generate_tile_data_pixmap(layer, z, x, y, tile_width_in_pixels, format, geography_year, draw_options)
     if format == 'png':
         out = io.BytesIO()
         #scipy.misc.imsave(out, tile_data, format='png')
@@ -841,7 +975,7 @@ def generate_tile_data_png_or_box(layer, z, x, y, tile_width_in_pixels, format, 
     else:
         return tile_data.tobytes()
     
-def generate_tile_data_mp4(layers, z, x, y, tile_width_in_pixels):
+def generate_tile_data_mp4(layers, z, x, y, tile_width_in_pixels, geography_year):
     # make ffmpeg
 
     cmd = ['/usr/bin/ffmpeg']
@@ -869,7 +1003,7 @@ def generate_tile_data_mp4(layers, z, x, y, tile_width_in_pixels):
 
     for frameno in range(0, len(layers)):
         layer = layers[frameno]
-        tile_pixels = generate_tile_data_pixmap(layer, z, x, y, tile_width_in_pixels, 'mp4')
+        tile_pixels = generate_tile_data_pixmap(layer, z, x, y, tile_width_in_pixels, geography_year, 'mp4')
         log('about to spoot frame %d of len %d' % (frameno, len(tile_pixels)))
         p.stdin.write(tile_pixels)
         log('done')
@@ -887,11 +1021,11 @@ def generate_tile_data_mp4(layers, z, x, y, tile_width_in_pixels):
     
     return video_contents
     
-def generate_tile_data(layer, z, x, y, use_c=False):
+def generate_tile_data(layer, z, x, y, geography_year, use_c=False):
     start_time = time.time()
     # remove block # and seq #, add color
     
-    prototile_path = f'prototiles/{z}/{x}/{y}.bin'
+    prototile_path = f'prototiles{"" if geography_year == 2010 else ".2020"}/{z}/{x}/{y}.bin'
     incount = int(os.path.getsize(prototile_path) / prototile_record_len)
     
     # Preallocate output array for returned tile
@@ -911,28 +1045,32 @@ def generate_tile_data(layer, z, x, y, use_c=False):
 
     return tile[0 : outcount * tile_record_len]
 
-layer_cache = LruDict(50) # max entries
+layer_cache = {
+    2010: LruDict(50), # max entries
+    2020: LruDict(50)
+}
 
-def find_or_generate_layer(layerdef):
-    if layer_cache.has(layerdef):
+def find_or_generate_layer(layerdef, geography_year):
+    if layer_cache[geography_year].has(layerdef):
         print(f'Using cached {layerdef}')
-        return layer_cache.get(layerdef)
+        return layer_cache[geography_year].get(layerdef)
 
     start_time = time.time()
     start_cputime_ms = cputime_ms()
     
-    layerdef_hash = hashlib.md5(layerdef.encode('utf-8')).hexdigest()
-    log(f'{layerdef_hash}: computing from {layerdef}')
+    layerdef_hash = hashlib.md5(f"{layerdef}{'' if geography_year == 2010 else ';2020'}".encode('utf-8')).hexdigest()
+    log(f'{layerdef_hash}: computing from {layerdef} with {geography_year} geography')
     colors = []
     populations = []
     for (color, expression) in [x.split(';') for x in layerdef.split(';;')]:
         colors.append(color)
-        populations.append(eval_layer_column(expression))
+        populations.append(eval_layer_column(expression, geography_year))
 
     layer = {'populations': populations,
              'colors': parse_colors(colors, encoding=np.float32),
-             'colors_rgba8': parse_colors(colors, encoding=np.uint32)}
-    layer_cache.insert(layerdef, layer)
+             'colors_rgba8': parse_colors(colors, encoding=np.uint32),
+             'year': geography_year}
+    layer_cache[geography_year].insert(layerdef, layer)
     duration = int(1000 * (time.time() - start_time))
     cpu = cputime_ms() - start_cputime_ms
     log(f'{layerdef_hash}: {duration}ms ({cpu}ms CPU) to create')
@@ -942,11 +1080,12 @@ def find_or_generate_layer(layerdef):
 
 @app.route('/tilesv1/<layersdef>/512x512/<z>/<x>/<y>.mp4')
 def serve_video_tile_v1_mp4(layersdef, z, x, y):
+    geography_year = 2010
     x = int(int(x) / 4)
     y = int(int(y) / 4)
     (x,y)=(y,x)
     try:
-        layers = [find_or_generate_layer(layer) for layer in layersdef.split(';;;')]
+        layers = [find_or_generate_layer(layer, geography_year) for layer in layersdef.split(';;;')]
         tile_width_in_pixels = 1024
         tile = generate_tile_data_mp4(layers, z, x, y, tile_width_in_pixels)
         
@@ -960,10 +1099,11 @@ def serve_video_tile_v1_mp4(layersdef, z, x, y):
 
 @app.route('/tilesv1/<layerdef>/<z>/<x>/<y>.png')
 def serve_tile_v1_png(layerdef, z, x, y):
+    geography_year=2010
     try:
-        layer = find_or_generate_layer(layerdef)
+        layer = find_or_generate_layer(layerdef, geography_year)
         tile_width_in_pixels = 512
-        tile = generate_tile_data_png_or_box(layer, z, x, y, tile_width_in_pixels, 'png')
+        tile = generate_tile_data_png_or_box(layer, z, x, y, tile_width_in_pixels, 'png', geography_year)
         #outcount = len(tile) / tile_record_len
         
         response = flask.Response(tile, mimetype='image/png')
@@ -973,8 +1113,8 @@ def serve_tile_v1_png(layerdef, z, x, y):
     response.headers['Access-Control-Allow-Origin'] = '*'
     return response
 
-def generate_tile_data_tbox(layers, z, x, y, tile_width_in_pixels, draw_options={}):
-    frames = [generate_tile_data_png_or_box(layer, z, x, y, tile_width_in_pixels, 'box', draw_options) for layer in layers]
+def generate_tile_data_tbox(layers, z, x, y, tile_width_in_pixels, geography_year, draw_options={}):
+    frames = [generate_tile_data_png_or_box(layer, z, x, y, tile_width_in_pixels, 'box', geography_year, draw_options) for layer in layers]
     return b''.join(frames)
 
 # HTML description of .box tile
@@ -994,12 +1134,13 @@ def describe_tile_box(tile, tile_width_in_pixels):
     return ret
 
 # Serves v1 and v2 "box" (single-frame) tiles 
-def serve_tile_box(layerdef, z, x, y, draw_options=None):
+def serve_tile_box(layerdef, z, x, y, geography_year, draw_options=None):
     log(f'serve tile box draw options= {draw_options}')
+    log(f'serve tile box geography year= {geography_year}')
     try:
-        layer = find_or_generate_layer(layerdef)
+        layer = find_or_generate_layer(layerdef, geography_year)
         tile_width_in_pixels = 256
-        tile = generate_tile_data_png_or_box(layer, z, x, y, tile_width_in_pixels, 'box', draw_options)
+        tile = generate_tile_data_png_or_box(layer, z, x, y, tile_width_in_pixels, 'box', geography_year, draw_options)
         if 'debug' in request.args:
             # decode the tile instead
             response = flask.Response(describe_tile_box(tile, tile_width_in_pixels))
@@ -1019,7 +1160,8 @@ def serve_tile_box(layerdef, z, x, y, draw_options=None):
 @gzipped
 def serve_tile_v1_box(layerdef, z, x, y):
     log(f'DEPRECATED URL {request.url};  switch to /tilesv2/layername instead')
-    return serve_tile_box(layerdef, z, x, y)
+    geography_year = 2010
+    return serve_tile_box(layerdef, z, x, y, geography_year)
 
 # .box V2 (single frame), using layer name
 # Looks up layer defintion -- column expressions and colors -- from database, which itself is loaded
@@ -1030,19 +1172,20 @@ def serve_tile_v2_box(layername, z, x, y):
     #dotmap_dict = SqliteDict(dotmap_layerdef_path, flag='c',
     #                         tablename=dotmap_layerdef_table_name,
     #                         autocommit=False)
-    return serve_tile_box(get_layerdef(layername), z, x, y, get_draw_options(layername))
+    return serve_tile_box(get_layerdef(layername), z, x, y, get_geography_year(layername), get_draw_options(layername))
 
 # .tbox V1 (animated)
 @app.route('/tilesv1/<layerdefs>/<z>/<x>/<y>.tbox')
 @gzipped
 def serve_tile_v1_tbox(layerdefs, z, x, y):
+    geography_year=2010
     try:
         if isinstance(layerdefs, list):
             layers = layerdefs
         else:
-            layers = [find_or_generate_layer(layerdef) for layerdef in layerdefs.split(';;;')]
+            layers = [find_or_generate_layer(layerdef, geography_year) for layerdef in layerdefs.split(';;;')]
         tile_width_in_pixels = 256
-        tile = generate_tile_data_tbox(layers, z, x, y, tile_width_in_pixels)
+        tile = generate_tile_data_tbox(layers, z, x, y, tile_width_in_pixels, geography_year)
         
         response = flask.Response(tile, mimetype='application/octet-stream')
     except:
@@ -1064,21 +1207,30 @@ def get_layerdef(layername):
 
 def get_draw_options(layername):
     return get_layer_from_db(layername)['drawopts']
+    
+def get_geography_year(layername: str) -> Literal[2010, 2020]:
+    return get_layer_from_db(layername)['geography_year']
 
 # .tbox V2 (animated)
 @app.route('/tilesv2/<layername>/<z>/<x>/<y>.tbox')
 @gzipped
 def serve_tile_v2_tbox(layername, z, x, y):
     frame_layernames = get_layerdef(layername).split('|')
-    log('serving tbox: layer %s expands to frames %s' % (layername, frame_layernames))
+    geography_years = sorted({get_geography_year(frame_layername) for frame_layername in frame_layernames})
 
-    layers = [find_or_generate_layer(get_layerdef(frame_layername)) for frame_layername in frame_layernames]
+    assert len(geography_years) == 1, f"All layers must have identical geography year for {layername} but instead have years {geography_years}."
+
+    geography_year = geography_years[0]
+
+    log(f'serving tbox: layer {layername} expands to frames {frame_layernames}')
+
+    layers = [find_or_generate_layer(get_layerdef(frame_layername), geography_year) for frame_layername in frame_layernames]
 
     draw_options = get_draw_options(layername)
     
     try:
         tile_width_in_pixels = 256
-        tile = generate_tile_data_tbox(layers, z, x, y, tile_width_in_pixels, draw_options)
+        tile = generate_tile_data_tbox(layers, z, x, y, tile_width_in_pixels, geography_year, draw_options)
         
         response = flask.Response(tile, mimetype='application/octet-stream')
     except:
@@ -1092,10 +1244,15 @@ def serve_tile_v2_tbox(layername, z, x, y):
 @app.route('/tilesv1/<layerdef>/<z>/<x>/<y>.<suffix>')
 @gzipped
 def serve_tile_v1(layerdef, z, x, y, suffix):
+    geography_year=2010
     assert(suffix != 'box')
+
+    if geography_year == 2020:
+        log("Using 2020 geographies")
+
     try:
-        layer = find_or_generate_layer(layerdef)
-        tile = generate_tile_data(layer, z, x, y, use_c=True)
+        layer = find_or_generate_layer(layerdef, geography_year)
+        tile = generate_tile_data(layer, z, x, y, geography_year, use_c=True)
         outcount = len(tile) / tile_record_len
         
         if suffix == 'debug':
@@ -1164,7 +1321,7 @@ def show_dataset_columns(dataset):
 
 @app.route('/data/<dataset>/<column>.float32')
 def serve_column_float32(dataset, column):
-    data = load_column(dataset, column)
+    data = load_column(dataset, column, 2020 if column.endswith("2020") else 2010)
     ret = flask.Response(data.tobytes(), mimetype="application/octet-stream")
     ret.headers['Access-Control-Allow-Origin'] = '*'
     return ret
@@ -1243,8 +1400,12 @@ def reload_layers():
         layer_id = dotmap_df.at[idx,'Share link identifier']
         draw_opts_str = dotmap_df.at[idx, 'Draw Options']
         anim_str = dotmap_df.at[idx,'AnimationLayers']
+        try:
+            geography_year = int(dotmap_df.at[idx,'GeographyYear'])
+        except:
+            geography_year = 2010
 
-        record = {'layer_id': layer_id, 'drawopts': '{}'}
+        record = {'layer_id': layer_id, 'drawopts': '{}', 'geography_year': geography_year}
 
         if not pd.isna(draw_opts_str) and not draw_opts_str=='':
             try:
@@ -1278,10 +1439,10 @@ def reload_layers():
     with engine.connect() as con:
         for record in records:
             con.execute(f"""
-                INSERT INTO {dotmaptiles_table} (layer_id, layerdef, drawopts)
-                    VALUES (%(layer_id)s, %(layerdef)s, %(drawopts)s)
+                INSERT INTO {dotmaptiles_table} (layer_id, layerdef, drawopts, geography_year)
+                    VALUES (%(layer_id)s, %(layerdef)s, %(drawopts)s, %(geography_year)s)
                 ON CONFLICT (layer_id) DO
-                    UPDATE SET layerdef=excluded.layerdef, drawopts=excluded.drawopts;""", 
+                    UPDATE SET layerdef=excluded.layerdef, drawopts=excluded.drawopts, geography_year=excluded.geography_year;""", 
                 record)
 
 

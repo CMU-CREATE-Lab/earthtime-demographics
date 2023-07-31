@@ -1,0 +1,12 @@
+jupyter
+requests
+sqlalchemy<2
+psycopg2-binary
+pandas
+geopandas
+matplotlib
+folium
+mapclassify
+flask
+sqlitedict
+imageio

@@ -1,7 +1,8 @@
-import ctypes, distutils, distutils.sysconfig, os, tempfile
+import ctypes, distutils, distutils.sysconfig, os, sys, tempfile
 from utils.utils import subprocess_check
 import numpy as np
 import pandas as pd
+
 
 def numpy_atomic_save(dest_filename, array):
     dir = os.path.dirname(os.path.abspath(dest_filename))
@@ -63,7 +64,7 @@ def compile_and_load(src):
             cmd += ' -L' + distutils.sysconfig.get_python_lib() + '/../..'
 
         #cmd += ' -lpython2.7'
-        cmd += ' -lpython3.8'
+        cmd += f' -lpython{sys.version_info.major}.{sys.version_info.minor}'
         
         srcfile_name = srcfile.name
         sofile_name = sofile.name

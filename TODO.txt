@@ -1,0 +1,40 @@
+Stage 1
+
+DONE * Add column to spreadsheet denoting 2020-based dotmap layer
+       https://docs.google.com/spreadsheets/d/1rCiksJv4aXi1usI0_9zdl4v5vuOfiHgMRidiDPt1WfE/edit#gid=616255658
+       https://api.earthtime.org/layer-catalogs/1rCiksJv4aXi1usI0_9zdl4v5vuOfiHgMRidiDPt1WfE.616255658
+DONE * Make sure new column doesn't break layers API server
+
+* Use ~rsargent/superconda-1 environment
+
+DONE * Load 2010->2020 crosswalk into python
+       nhgis_blk2010_blk2020_ge.csv 
+DONE * Get union of 2020 geoids from crosswalk and 2020 postgres tables
+       * from postgres: census_db_2020_geoids.json
+       * result: union of the same set of geoids
+DONE * Implement transforming 2010 column into 2020
+       * Pull sparse multiplication from "C04 Ingest 1990"...
+       * That notebook has 1990-2010 example.  Especially see the sparse 
+
+              1. Obtain data of interest for 1990 blocks
+                     E.g., using the NHGIS Data Finder, find and download tables for the Block geographic level for the year 1990 (dataset 1990_STF1)
+              2. Join the 1990-block-to-2010-block crosswalk to the 1990 block data of interest
+              3. Multiply the 1990 block counts by the crosswalk's interpolation weights, producing estimated counts for all 1990-2010 block intersections, or "atoms"
+              4. Sum these atom counts for each 2010 block
+
+
+DONE * augment load_column from tileserve.py
+       * add optional argument "geog_year" which defaults to 2010
+       * if geog_year is 2020
+              * look for file ending with .2020.float32
+                     * if not found:
+                            * call load_column with geog_year 2010
+                            * interpolate using sparse crosswalk
+                            * save .2020.float32 (see example of numpy->float32)
+                            * be sure to use logic for atomic writing
+
+###############
+
+* Implement expressions using 2020 columns
+
+
