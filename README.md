@@ -10,8 +10,8 @@ To check out and run:
     python -m pip install --upgrade pip
     pip install -r requirements.txt
 
-    # Provide symlinks to columncache and various prototile directories.  (Below assumes placement in ~rsargent/uwsgi on hal15)
-    ln -s ../dotmaptiles-data/server/{columncache,prototiles,prototiles002,prototiles003,prototiles.2020} .
+    # Provide symlinks to columncache, expression_cache and various prototile directories.  (Below assumes placement in ~rsargent/uwsgi on hal15)
+    ln -s ../dotmaptiles-data/server/{columncache,prototiles,prototiles002,prototiles003,prototiles.2020,expression_cache} .
 
     # Create portnum.txt with the port you want to serve from, e.g. 5052 for iter002 on hal15
     
